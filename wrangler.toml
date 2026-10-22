@@ -1,0 +1,14 @@
+name = "nuvyru-api"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# Fase 2: descomenta cuando crees los recursos en Cloudflare
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "nuvyru"
+# database_id = "PENDIENTE"
+# [[r2_buckets]]
+# binding = "MEDIA"
+# bucket_name = "nuvyru-media"
+# Fase 7: [[durable_objects.bindings]] name = "LIVE_ROOM", class_name = "LiveRoom"
+# Secretos (NUNCA en este archivo): wrangler secret put ORYA_API_KEY
