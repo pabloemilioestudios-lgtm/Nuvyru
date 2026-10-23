@@ -1,4 +1,4 @@
-// Nuvyru API · Fase 2: cuentas y publicaciones (Cloudflare Workers + D1)
+// Nuvyru API · cuentas, publicaciones, medios (R2), perfiles, búsqueda y mascotas
 const enc = new TextEncoder();
 const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const rand = (n = 32) => b64(crypto.getRandomValues(new Uint8Array(n)));
@@ -21,7 +21,6 @@ const cors = (req, env) => {
 };
 const json = (req, env, body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...cors(req, env) } });
-
 async function readBody(req) {
   if (Number(req.headers.get("Content-Length") || 0) > 10000) return null;
   try { return await req.json(); } catch { return null; }
@@ -37,12 +36,11 @@ async function limit(env, key, max, sec) {
   await env.DB.prepare("UPDATE nv_rate SET count=count+1 WHERE k=?").bind(key).run();
   return true;
 }
+const PROFILE = "SELECT u.id,u.username,u.display_name,u.bio,u.created_at,pr.avatar_id,pr.banner_id,pr.website,pr.location,pr.pronouns,pr.accent FROM nv_users u LEFT JOIN nv_profiles pr ON pr.user_id=u.id";
 async function auth(req, env) {
   const h = req.headers.get("Authorization") || "";
   if (!h.startsWith("Bearer ")) return null;
-  return env.DB.prepare(
-    "SELECT u.id,u.username,u.display_name,u.bio FROM nv_sessions s JOIN nv_users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?"
-  ).bind(await sha(h.slice(7)), Date.now()).first();
+  return env.DB.prepare(PROFILE + " JOIN nv_sessions s ON s.user_id=u.id WHERE s.token_hash=? AND s.expires_at>?").bind(await sha(h.slice(7)), Date.now()).first();
 }
 async function newSession(env, uid) {
   const t = rand();
@@ -50,19 +48,57 @@ async function newSession(env, uid) {
   await env.DB.prepare("DELETE FROM nv_sessions WHERE expires_at<?").bind(Date.now()).run();
   return t;
 }
-const pub = (u) => ({ username: u.username, display_name: u.display_name, bio: u.bio });
+const pub = (u) => ({
+  username: u.username, display_name: u.display_name, bio: u.bio || "", avatar_id: u.avatar_id || null, banner_id: u.banner_id || null,
+  website: u.website || "", location: u.location || "", pronouns: u.pronouns || "", accent: u.accent || "violet",
+});
 
-const POSTS_SQL = `SELECT p.id,p.body,p.visibility,p.created_at,u.username,u.display_name,
+// ---- Medios (R2)
+const UUID = /^[0-9a-f-]{36}$/;
+const ACCENTS = ["violet", "blue", "cyan", "orange", "pink", "green"];
+const MAX_IMG = 8 * 1024 * 1024, MAX_VID = 100 * 1024 * 1024;
+const IMG_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"], VID_TYPES = ["video/mp4", "video/webm", "video/quicktime"];
+function sniff(mime, b) {
+  if (!b || b.length < 12) return false;
+  const at = (i, s) => [...s].every((c, k) => b[i + k] === c.charCodeAt(0));
+  if (mime === "image/jpeg") return b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff;
+  if (mime === "image/png") return b[0] === 0x89 && at(1, "PNG");
+  if (mime === "image/gif") return at(0, "GIF8");
+  if (mime === "image/webp") return at(0, "RIFF") && at(8, "WEBP");
+  if (mime === "video/webm") return b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3;
+  return at(4, "ftyp"); // mp4 / quicktime
+}
+async function dropMedia(env, rows) {
+  if (!rows.length) return;
+  if (env.MEDIA) for (let i = 0; i < rows.length; i += 1000) await env.MEDIA.delete(rows.slice(i, i + 1000).map((r) => r.key));
+  for (let i = 0; i < rows.length; i += 50) {
+    const part = rows.slice(i, i + 50);
+    await env.DB.prepare(`DELETE FROM nv_media WHERE id IN (${part.map(() => "?").join(",")})`).bind(...part.map((r) => r.id)).run();
+  }
+}
+const qs = (a) => a.map(() => "?").join(",");
+
+// ---- Publicaciones
+const POSTS_SQL = `SELECT p.id,p.body,p.visibility,p.created_at,u.username,u.display_name,pr.avatar_id,
  (SELECT COUNT(*) FROM nv_likes l WHERE l.post_id=p.id) AS like_count,
  EXISTS(SELECT 1 FROM nv_likes l WHERE l.post_id=p.id AND l.user_id=?1) AS liked,
  EXISTS(SELECT 1 FROM nv_saves s WHERE s.post_id=p.id AND s.user_id=?1) AS saved
- FROM nv_posts p JOIN nv_users u ON u.id=p.user_id
+ FROM nv_posts p JOIN nv_users u ON u.id=p.user_id LEFT JOIN nv_profiles pr ON pr.user_id=u.id
  WHERE (p.visibility='public' OR p.user_id=?1) AND (?2 IS NULL OR u.username=?2) AND (?3 IS NULL OR p.created_at<?3)
+ AND (?4 IS NULL OR EXISTS(SELECT 1 FROM nv_post_media pm JOIN nv_media m ON m.id=pm.media_id WHERE pm.post_id=p.id AND (?4='media' OR m.kind=?4)))
+ AND (?5 IS NULL OR p.body LIKE ?5 ESCAPE '\\') AND (?6=0 OR p.visibility='public') AND (?7 IS NULL OR p.id=?7)
  ORDER BY p.created_at DESC LIMIT 30`;
+async function listPosts(env, me, o = {}) {
+  const { results } = await env.DB.prepare(POSTS_SQL).bind(me.id, o.user ?? null, o.before ?? null, o.kind ?? null, o.q ?? null, o.pub ? 1 : 0, o.id ?? null).all();
+  const ids = results.map((r) => r.id), by = {};
+  if (ids.length) {
+    const { results: ms } = await env.DB.prepare(`SELECT pm.post_id,m.id,m.kind FROM nv_post_media pm JOIN nv_media m ON m.id=pm.media_id WHERE pm.post_id IN (${qs(ids)}) ORDER BY pm.pos`).bind(...ids).all();
+    for (const x of ms) (by[x.post_id] ||= []).push({ id: x.id, kind: x.kind });
+  }
+  return results.map((r) => ({ ...r, avatar_id: r.avatar_id || null, liked: !!r.liked, saved: !!r.saved, mine: r.username === me.username, media: by[r.id] || [] }));
+}
 
-const PLANNED = { "/api/comments": 3, "/api/follows": 3, "/api/notifications": 3, "/api/search": 3, "/api/media": 4, "/api/messages": 4, "/api/badges": 5, "/api/orya": 6, "/api/live": 7 };
-
-// ---- Mascotas (Fase 5). El tiempo y todas las reglas viven en el servidor.
+// ---- Mascotas
 const HATCH_MS = 4 * 3600e3, FLOOR = 30, DAILY_XP = 60, DECAY_PER_H = 1;
 const SPECIES = ["nubi", "lumo", "brisa", "zafi"], DEF = { nubi: "Nubi", lumo: "Lumo", brisa: "Brisa", zafi: "Zafi" };
 const CARE = {
@@ -75,7 +111,6 @@ const STAGES = ["cria", "joven", "adulto"], UNLOCK = { hat: "cria", glasses: "jo
 const stageOf = (xp) => (xp >= 300 ? "adulto" : xp >= 100 ? "joven" : "cria");
 const clamp = (n) => Math.max(0, Math.min(100, Math.round(n)));
 const day = (t) => new Date(t).toISOString().slice(0, 10);
-// La energía y la alegría bajan despacio pero NUNCA por debajo de FLOOR: descansar no castiga.
 const decay = (v, hrs) => (v <= FLOOR ? v : Math.max(FLOOR, v - hrs * DECAY_PER_H));
 function petView(r, now) {
   if (r.status === "egg") return { status: "egg", hatch_at: r.hatch_at, hatch_in_ms: Math.max(0, r.hatch_at - now) };
@@ -99,6 +134,8 @@ async function getPet(env, uid, now) {
   return r;
 }
 
+const PLANNED = { "/api/comments": 3, "/api/follows": 3, "/api/notifications": 3, "/api/messages": 4, "/api/badges": 5, "/api/orya": 6, "/api/live": 7 };
+
 export default {
   async fetch(req, env) {
     if (req.method === "OPTIONS") return new Response(null, { headers: cors(req, env) });
@@ -106,11 +143,27 @@ export default {
     const out = (b, s = 200) => json(req, env, b, s);
     const fail = (s, error, message) => out({ error, message }, s);
     try {
-      if (p === "/api/health") return out({ ok: true, service: "nuvyru-api", db: !!env.DB });
+      if (p === "/api/health") return out({ ok: true, service: "nuvyru-api", db: !!env.DB, storage: !!env.MEDIA });
       const hit = Object.keys(PLANNED).find((k) => p.startsWith(k));
       if (hit) return fail(501, "not_implemented", "Esta función llega en la fase " + PLANNED[hit]);
       if (!env.DB) return fail(503, "no_db", "La base de datos D1 no está configurada");
       const ip = req.headers.get("CF-Connecting-IP") || "local";
+      let mt;
+
+      // Ver un archivo (las etiquetas <img> y <video> no envían sesión; el id es imposible de adivinar)
+      if ((mt = p.match(/^\/api\/media\/([0-9a-f-]{36})$/)) && m === "GET") {
+        if (!env.MEDIA) return fail(503, "no_storage", "El almacenamiento no está configurado");
+        const row = await env.DB.prepare("SELECT key,mime FROM nv_media WHERE id=?").bind(mt[1]).first();
+        const o = row && (await env.MEDIA.get(row.key, { range: req.headers }));
+        if (!o) return fail(404, "not_found", "Archivo no encontrado");
+        const h = new Headers({ ...cors(req, env), "Content-Type": row.mime, "Accept-Ranges": "bytes", "Cache-Control": "public, max-age=31536000, immutable", "Cross-Origin-Resource-Policy": "cross-origin", "X-Content-Type-Options": "nosniff" });
+        let status = 200;
+        if (req.headers.get("Range") && o.range) {
+          const off = o.range.offset ?? Math.max(0, o.size - o.range.suffix), len = o.range.length ?? o.size - off;
+          h.set("Content-Range", `bytes ${off}-${off + len - 1}/${o.size}`); h.set("Content-Length", String(len)); status = 206;
+        } else h.set("Content-Length", String(o.size));
+        return new Response(o.body, { status, headers: h });
+      }
 
       if (p === "/api/auth/register" && m === "POST") {
         if (!(await limit(env, "reg:" + ip, 5, 3600))) return fail(429, "rate_limited", "Demasiados intentos. Inténtalo más tarde");
@@ -128,13 +181,13 @@ export default {
           await env.DB.prepare("INSERT INTO nv_users (id,username,display_name,bio,pass_hash,pass_salt,birth_year,created_at) VALUES (?,?,?,?,?,?,?,?)")
             .bind(id, username, name, "", hash, salt, by, Date.now()).run();
         } catch { return fail(409, "username_taken", "Ese nombre de usuario ya existe"); }
-        return out({ token: await newSession(env, id), user: { username, display_name: name, bio: "" } }, 201);
+        return out({ token: await newSession(env, id), user: pub({ username, display_name: name }) }, 201);
       }
       if (p === "/api/auth/login" && m === "POST") {
         const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
         const username = String(b.username || "").trim().toLowerCase(), pw = String(b.password || "").slice(0, 128);
         if (!(await limit(env, "login:" + ip + ":" + username, 10, 900))) return fail(429, "rate_limited", "Demasiados intentos. Espera unos minutos");
-        const row = await env.DB.prepare("SELECT id,username,display_name,bio,pass_hash,pass_salt FROM nv_users WHERE username=?").bind(username).first();
+        const row = await env.DB.prepare(PROFILE.replace("u.bio,", "u.bio,u.pass_hash,u.pass_salt,") + " WHERE u.username=?").bind(username).first();
         const h = await pbkdf2(pw, row ? row.pass_salt : "x".repeat(22));
         if (!row || !same(h, row.pass_hash)) return fail(401, "invalid_credentials", "Usuario o contraseña incorrectos");
         return out({ token: await newSession(env, row.id), user: pub(row) });
@@ -150,21 +203,52 @@ export default {
       if (p === "/api/me" && m === "GET") return out({ user: pub(me) });
       if (p === "/api/me" && m === "PATCH") {
         const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
-        const name = b.display_name === undefined ? me.display_name : String(b.display_name).trim();
-        const bio = b.bio === undefined ? me.bio : String(b.bio).trim();
+        const pick = (k, cur) => (b[k] === undefined ? cur || "" : String(b[k]).trim());
+        const name = pick("display_name", me.display_name), bio = pick("bio", me.bio), loc = pick("location", me.location), pron = pick("pronouns", me.pronouns), site = pick("website", me.website);
+        const accent = b.accent === undefined ? me.accent || "violet" : String(b.accent);
         if (name.length < 1 || name.length > 40) return fail(400, "invalid_name", "El nombre debe tener entre 1 y 40 caracteres");
-        if (bio.length > 160) return fail(400, "invalid_bio", "La biografía admite hasta 160 caracteres");
-        await env.DB.prepare("UPDATE nv_users SET display_name=?, bio=? WHERE id=?").bind(name, bio, me.id).run();
-        return out({ user: { username: me.username, display_name: name, bio } });
+        if (bio.length > 200) return fail(400, "invalid_bio", "La biografía admite hasta 200 caracteres");
+        if (loc.length > 40) return fail(400, "invalid_location", "La ubicación admite hasta 40 caracteres");
+        if (pron.length > 20) return fail(400, "invalid_pronouns", "Los pronombres admiten hasta 20 caracteres");
+        if (!ACCENTS.includes(accent)) return fail(400, "invalid_accent", "Color no válido");
+        if (site) {
+          let ok = site.length <= 100;
+          try { ok = ok && ["http:", "https:"].includes(new URL(site).protocol); } catch { ok = false; }
+          if (!ok) return fail(400, "invalid_website", "Escribe una dirección web válida que empiece por https://");
+        }
+        let avatar = me.avatar_id || null, banner = me.banner_id || null;
+        const oldIds = [];
+        for (const k of ["avatar_id", "banner_id"]) {
+          if (b[k] === undefined) continue;
+          const v = b[k] ? String(b[k]) : null, cur = k === "avatar_id" ? avatar : banner;
+          if (v && v !== cur && (!UUID.test(v) || !(await env.DB.prepare("SELECT 1 FROM nv_media WHERE id=? AND user_id=? AND kind='image' AND NOT EXISTS (SELECT 1 FROM nv_post_media pm WHERE pm.media_id=nv_media.id)").bind(v, me.id).first()))) return fail(400, "invalid_media", "La imagen no es válida (sube una foto nueva para tu perfil)");
+          if (v !== cur) { if (cur) oldIds.push(cur); if (k === "avatar_id") avatar = v; else banner = v; }
+        }
+        const keep = [avatar, banner].filter(Boolean);
+        await env.DB.batch([
+          env.DB.prepare("UPDATE nv_users SET display_name=?, bio=? WHERE id=?").bind(name, bio, me.id),
+          env.DB.prepare("INSERT INTO nv_profiles (user_id,avatar_id,banner_id,website,location,pronouns,accent) VALUES (?,?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET avatar_id=excluded.avatar_id,banner_id=excluded.banner_id,website=excluded.website,location=excluded.location,pronouns=excluded.pronouns,accent=excluded.accent")
+            .bind(me.id, avatar, banner, site, loc, pron, accent),
+          ...(keep.length ? [env.DB.prepare(`UPDATE nv_media SET attached=1 WHERE id IN (${qs(keep)})`).bind(...keep)] : []),
+        ]);
+        const gone = oldIds.filter((x) => x !== avatar && x !== banner);
+        if (gone.length) { const { results } = await env.DB.prepare(`SELECT id,key FROM nv_media WHERE id IN (${qs(gone)}) AND user_id=? AND NOT EXISTS (SELECT 1 FROM nv_post_media pm WHERE pm.media_id=nv_media.id)`).bind(...gone, me.id).all(); await dropMedia(env, results); }
+        return out({ user: pub({ ...me, display_name: name, bio, avatar_id: avatar, banner_id: banner, website: site, location: loc, pronouns: pron, accent }) });
       }
       if (p === "/api/me" && m === "DELETE") {
         const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
         const row = await env.DB.prepare("SELECT pass_hash,pass_salt FROM nv_users WHERE id=?").bind(me.id).first();
         if (!same(await pbkdf2(String(b.password || "").slice(0, 128), row.pass_salt), row.pass_hash)) return fail(403, "invalid_credentials", "Contraseña incorrecta");
+        const { results: mine } = await env.DB.prepare("SELECT id,key FROM nv_media WHERE user_id=?").bind(me.id).all();
+        if (env.MEDIA) for (let i = 0; i < mine.length; i += 1000) await env.MEDIA.delete(mine.slice(i, i + 1000).map((r) => r.key));
+        const own = "(SELECT id FROM nv_posts WHERE user_id=?)";
         await env.DB.batch([
-          env.DB.prepare("DELETE FROM nv_likes WHERE post_id IN (SELECT id FROM nv_posts WHERE user_id=?) OR user_id=?").bind(me.id, me.id),
-          env.DB.prepare("DELETE FROM nv_saves WHERE post_id IN (SELECT id FROM nv_posts WHERE user_id=?) OR user_id=?").bind(me.id, me.id),
+          env.DB.prepare(`DELETE FROM nv_likes WHERE post_id IN ${own} OR user_id=?`).bind(me.id, me.id),
+          env.DB.prepare(`DELETE FROM nv_saves WHERE post_id IN ${own} OR user_id=?`).bind(me.id, me.id),
+          env.DB.prepare(`DELETE FROM nv_post_media WHERE post_id IN ${own}`).bind(me.id),
+          env.DB.prepare("DELETE FROM nv_media WHERE user_id=?").bind(me.id),
           env.DB.prepare("DELETE FROM nv_posts WHERE user_id=?").bind(me.id),
+          env.DB.prepare("DELETE FROM nv_profiles WHERE user_id=?").bind(me.id),
           env.DB.prepare("DELETE FROM nv_pets WHERE user_id=?").bind(me.id),
           env.DB.prepare("DELETE FROM nv_sessions WHERE user_id=?").bind(me.id),
           env.DB.prepare("DELETE FROM nv_users WHERE id=?").bind(me.id),
@@ -172,20 +256,32 @@ export default {
         return out({ ok: true });
       }
 
-      if (p === "/api/posts" && m === "GET") {
-        const u = (url.searchParams.get("user") || "").toLowerCase() || null, before = Number(url.searchParams.get("before")) || null;
-        const { results } = await env.DB.prepare(POSTS_SQL).bind(me.id, u, before).all();
-        return out({ posts: results.map((r) => ({ ...r, liked: !!r.liked, saved: !!r.saved, mine: r.username === me.username })) });
+      // ---- Subir fotos y videos (cuerpo binario directo; se guarda en R2 sin cargarlo entero en memoria)
+      if (p === "/api/media" && m === "POST") {
+        if (!env.MEDIA) return fail(503, "no_storage", "El almacenamiento de archivos (R2) no está configurado");
+        if (!(await limit(env, "up:" + me.id, 40, 3600))) return fail(429, "rate_limited", "Has subido demasiados archivos. Inténtalo en un rato");
+        const kind = url.searchParams.get("kind"), mime = (req.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+        if (!["image", "video"].includes(kind) || !(kind === "image" ? IMG_TYPES : VID_TYPES).includes(mime)) return fail(415, "unsupported_type", "Formato no admitido. Fotos: JPG, PNG, WEBP o GIF. Videos: MP4, WEBM o MOV");
+        const len = Number(req.headers.get("Content-Length") || 0);
+        if (!len || !req.body) return fail(411, "length_required", "Falta el tamaño del archivo");
+        if (len > (kind === "image" ? MAX_IMG : MAX_VID)) return fail(413, "too_large", kind === "image" ? "La foto supera 8 MB" : "El video supera 100 MB");
+        const reader = req.body.getReader(), first = await reader.read();
+        if (!sniff(mime, first.value)) return fail(415, "invalid_file", "El archivo no es válido o no coincide con su formato");
+        const id = crypto.randomUUID(), key = `u/${me.id}/${id}`, { readable, writable } = new FixedLengthStream(len);
+        const pipe = (async () => {
+          const w = writable.getWriter(); await w.write(first.value);
+          for (;;) { const r = await reader.read(); if (r.done) break; await w.write(r.value); }
+          await w.close();
+        })();
+        try { await Promise.all([env.MEDIA.put(key, readable, { httpMetadata: { contentType: mime } }), pipe]); }
+        catch { await env.MEDIA.delete(key).catch(() => {}); return fail(400, "upload_failed", "La subida se interrumpió. Inténtalo de nuevo"); }
+        await env.DB.prepare("INSERT INTO nv_media (id,user_id,kind,mime,size,key,created_at) VALUES (?,?,?,?,?,?,?)").bind(id, me.id, kind, mime, len, key, Date.now()).run();
+        const { results: orphans } = await env.DB.prepare("SELECT id,key FROM nv_media WHERE attached=0 AND created_at<? LIMIT 20").bind(Date.now() - 864e5).all();
+        await dropMedia(env, orphans);
+        return out({ media: { id, kind, mime, size: len } }, 201);
       }
-      if (p === "/api/posts" && m === "POST") {
-        if (!(await limit(env, "post:" + me.id, 20, 3600))) return fail(429, "rate_limited", "Has publicado demasiado. Inténtalo en un rato");
-        const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
-        const text = String(b.body || "").trim(), vis = b.visibility === "private" ? "private" : "public";
-        if (!text || text.length > 500) return fail(400, "invalid_body", "La publicación debe tener entre 1 y 500 caracteres");
-        const id = crypto.randomUUID(), now = Date.now();
-        await env.DB.prepare("INSERT INTO nv_posts (id,user_id,body,visibility,created_at) VALUES (?,?,?,?,?)").bind(id, me.id, text, vis, now).run();
-        return out({ post: { id, body: text, visibility: vis, created_at: now, username: me.username, display_name: me.display_name, like_count: 0, liked: false, saved: false, mine: true } }, 201);
-      }
+
+      // ---- Mascotas
       if (p === "/api/pet" && m === "GET") {
         const now = Date.now(), r = await getPet(env, me.id, now);
         return out({ pet: r ? petView(r, now) : null });
@@ -238,7 +334,43 @@ export default {
         await env.DB.prepare("DELETE FROM nv_pets WHERE user_id=?").bind(me.id).run();
         return out({ ok: true });
       }
-      let mt;
+
+      // ---- Publicaciones
+      if (p === "/api/posts" && m === "GET") {
+        const sp = url.searchParams, kind = sp.get("kind");
+        const posts = await listPosts(env, me, {
+          user: (sp.get("user") || "").toLowerCase() || null, before: Number(sp.get("before")) || null,
+          kind: ["image", "video", "media"].includes(kind) ? kind : null, pub: sp.get("public") === "1",
+        });
+        return out({ posts });
+      }
+      if (p === "/api/posts" && m === "POST") {
+        if (!(await limit(env, "post:" + me.id, 20, 3600))) return fail(429, "rate_limited", "Has publicado demasiado. Inténtalo en un rato");
+        const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
+        const text = String(b.body || "").trim(), vis = b.visibility === "private" ? "private" : "public";
+        const ids = Array.isArray(b.media) ? b.media.map(String) : [];
+        if (ids.length > 10 || new Set(ids).size !== ids.length || ids.some((x) => !UUID.test(x))) return fail(400, "invalid_media", "Puedes adjuntar hasta 10 fotos o 1 video");
+        if ((!text && !ids.length) || text.length > 500) return fail(400, "invalid_body", "Escribe un texto (máximo 500 caracteres) o adjunta una foto o video");
+        let rows = [];
+        if (ids.length) {
+          const { results } = await env.DB.prepare(`SELECT id,kind FROM nv_media WHERE user_id=? AND attached=0 AND id IN (${qs(ids)})`).bind(me.id, ...ids).all();
+          const byId = Object.fromEntries(results.map((r) => [r.id, r]));
+          rows = ids.map((x) => byId[x]);
+          const vids = rows.filter((r) => r && r.kind === "video").length;
+          if (rows.some((r) => !r) || (vids && (vids > 1 || rows.length > 1))) return fail(400, "invalid_media", "Los archivos no son válidos: usa hasta 10 fotos, o un solo video");
+        }
+        const id = crypto.randomUUID(), now = Date.now();
+        await env.DB.batch([
+          env.DB.prepare("INSERT INTO nv_posts (id,user_id,body,visibility,created_at) VALUES (?,?,?,?,?)").bind(id, me.id, text, vis, now),
+          ...rows.map((r, i) => env.DB.prepare("INSERT INTO nv_post_media (post_id,media_id,pos) VALUES (?,?,?)").bind(id, r.id, i)),
+          ...rows.map((r) => env.DB.prepare("UPDATE nv_media SET attached=1 WHERE id=?").bind(r.id)),
+        ]);
+        return out({ post: { id, body: text, visibility: vis, created_at: now, username: me.username, display_name: me.display_name, avatar_id: me.avatar_id || null, like_count: 0, liked: false, saved: false, mine: true, media: rows.map((r) => ({ id: r.id, kind: r.kind })) } }, 201);
+      }
+      if ((mt = p.match(/^\/api\/posts\/([0-9a-f-]{36})$/)) && m === "GET") {
+        const [post] = await listPosts(env, me, { id: mt[1] });
+        return post ? out({ post }) : fail(404, "not_found", "La publicación no existe");
+      }
       if ((mt = p.match(/^\/api\/posts\/([0-9a-f-]{36})\/(like|save)$/)) && m === "POST") {
         if (!(await limit(env, "act:" + me.id, 120, 60))) return fail(429, "rate_limited", "Demasiadas acciones seguidas");
         const ok = await env.DB.prepare("SELECT id FROM nv_posts WHERE id=? AND (visibility='public' OR user_id=?)").bind(mt[1], me.id).first();
@@ -251,10 +383,41 @@ export default {
         return out({ liked: !had, like_count: c.n });
       }
       if ((mt = p.match(/^\/api\/posts\/([0-9a-f-]{36})$/)) && m === "DELETE") {
-        const r = await env.DB.prepare("DELETE FROM nv_posts WHERE id=? AND user_id=?").bind(mt[1], me.id).run();
-        if (!r.meta.changes) return fail(404, "not_found", "La publicación no existe o no es tuya");
-        await env.DB.batch([env.DB.prepare("DELETE FROM nv_likes WHERE post_id=?").bind(mt[1]), env.DB.prepare("DELETE FROM nv_saves WHERE post_id=?").bind(mt[1])]);
+        if (!(await env.DB.prepare("SELECT 1 FROM nv_posts WHERE id=? AND user_id=?").bind(mt[1], me.id).first())) return fail(404, "not_found", "La publicación no existe o no es tuya");
+        const { results: files } = await env.DB.prepare("SELECT m.id,m.key FROM nv_post_media pm JOIN nv_media m ON m.id=pm.media_id WHERE pm.post_id=?").bind(mt[1]).all();
+        if (env.MEDIA && files.length) await env.MEDIA.delete(files.map((f) => f.key));
+        await env.DB.batch([
+          env.DB.prepare("DELETE FROM nv_likes WHERE post_id=?").bind(mt[1]), env.DB.prepare("DELETE FROM nv_saves WHERE post_id=?").bind(mt[1]),
+          env.DB.prepare("DELETE FROM nv_post_media WHERE post_id=?").bind(mt[1]),
+          ...files.map((f) => env.DB.prepare("DELETE FROM nv_media WHERE id=?").bind(f.id)),
+          env.DB.prepare("DELETE FROM nv_posts WHERE id=?").bind(mt[1]),
+        ]);
         return out({ ok: true });
+      }
+
+      // ---- Perfiles ajenos, búsqueda y tendencias
+      if ((mt = p.match(/^\/api\/users\/([A-Za-z0-9_.]{3,24})$/)) && m === "GET") {
+        const u = await env.DB.prepare(PROFILE + " WHERE u.username=?").bind(mt[1].toLowerCase()).first();
+        if (!u) return fail(404, "not_found", "Ese usuario no existe");
+        const cnt = await env.DB.prepare("SELECT COUNT(*) AS n FROM nv_posts WHERE user_id=? AND (visibility='public' OR user_id=?)").bind(u.id, me.id).first();
+        const pt = await env.DB.prepare("SELECT species,name,xp,accessory,energy FROM nv_pets WHERE user_id=? AND status='hatched' AND show_on_profile=1").bind(u.id).first();
+        return out({ user: { ...pub(u), created_at: u.created_at, post_count: cnt.n, is_me: u.id === me.id, pet: pt ? { species: pt.species, name: pt.name, stage: stageOf(pt.xp), accessory: pt.accessory, energy: pt.energy } : null } });
+      }
+      if (p === "/api/search" && m === "GET") {
+        if (!(await limit(env, "search:" + me.id, 60, 60))) return fail(429, "rate_limited", "Demasiadas búsquedas seguidas");
+        const q = (url.searchParams.get("q") || "").trim().slice(0, 50);
+        if (!q) return out({ users: [], posts: [] });
+        const uq = q.replace(/^@/, ""), like = (s) => "%" + s.replace(/[\\%_]/g, "\\$&") + "%";
+        const { results: users } = await env.DB.prepare(
+          "SELECT u.username,u.display_name,u.bio,pr.avatar_id FROM nv_users u LEFT JOIN nv_profiles pr ON pr.user_id=u.id WHERE u.username LIKE ?1 ESCAPE '\\' OR u.display_name LIKE ?1 ESCAPE '\\' ORDER BY (u.username=?2) DESC, u.username LIMIT 10"
+        ).bind(like(uq), uq.toLowerCase()).all();
+        return out({ users: users.map((u) => ({ ...u, avatar_id: u.avatar_id || null })), posts: await listPosts(env, me, { q: like(q), pub: true }) });
+      }
+      if (p === "/api/trending" && m === "GET") {
+        const { results } = await env.DB.prepare("SELECT body FROM nv_posts WHERE visibility='public' AND created_at>? ORDER BY created_at DESC LIMIT 500").bind(Date.now() - 7 * 864e5).all();
+        const count = {};
+        for (const r of results) for (const t of new Set((r.body.toLowerCase().match(/#[\p{L}\p{N}_]{2,30}/gu) || []))) count[t] = (count[t] || 0) + 1;
+        return out({ tags: Object.entries(count).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([tag, n]) => ({ tag, count: n })) });
       }
       return fail(404, "not_found", "Ruta no encontrada");
     } catch (e) {

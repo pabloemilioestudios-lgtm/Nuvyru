@@ -3,15 +3,13 @@ main = "src/index.js"
 compatibility_date = "2026-10-01"
 
 [vars]
-# Dominio(s) del frontend, separados por coma, sin barra final ni ruta del repositorio
-ALLOWED_ORIGIN = "https://TU-USUARIO.github.io"
+ALLOWED_ORIGIN = "https://pabloemilioestudios-lgtm.github.io"
 
-# Pon aquí la D1 que ya usas (npx wrangler d1 list te da el nombre y el id)
 [[d1_databases]]
 binding = "DB"
-database_name = "PENDIENTE"
-database_id = "PENDIENTE"
+database_name = "orya-db"
+database_id = "92667e81-2ecd-4948-aacf-03a3631cba26"
 
-# Fase 4: [[r2_buckets]] binding = "MEDIA", bucket_name = "nuvyru-media"
-# Fase 7: Durable Objects para LIVE
-# Secretos (nunca aquí): npx wrangler secret put NOMBRE
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "nuvyru-media"

@@ -7,7 +7,8 @@ CREATE TABLE IF NOT EXISTS nv_users (
   pass_hash TEXT NOT NULL,
   pass_salt TEXT NOT NULL,
   birth_year INTEGER NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  avatar_id TEXT
 );
 CREATE TABLE IF NOT EXISTS nv_sessions (
   token_hash TEXT PRIMARY KEY,
@@ -41,4 +42,21 @@ CREATE TABLE IF NOT EXISTS nv_pets (
   updated_at INTEGER NOT NULL,
   last_feed INTEGER NOT NULL DEFAULT 0, last_play INTEGER NOT NULL DEFAULT 0,
   last_rest INTEGER NOT NULL DEFAULT 0, last_cuddle INTEGER NOT NULL DEFAULT 0
+);
+
+-- Medios (fotos y videos guardados en R2), perfiles ampliados y álbumes
+CREATE TABLE IF NOT EXISTS nv_media (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('image','video')),
+  mime TEXT NOT NULL, size INTEGER NOT NULL, key TEXT NOT NULL,
+  attached INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_media_user ON nv_media(user_id);
+CREATE TABLE IF NOT EXISTS nv_post_media (
+  post_id TEXT NOT NULL, media_id TEXT NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (post_id, media_id)
+);
+CREATE INDEX IF NOT EXISTS nv_post_media_post ON nv_post_media(post_id, pos);
+CREATE TABLE IF NOT EXISTS nv_profiles (
+  user_id TEXT PRIMARY KEY, avatar_id TEXT, banner_id TEXT,
+  website TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', pronouns TEXT NOT NULL DEFAULT '',
+  accent TEXT NOT NULL DEFAULT 'violet'
 );

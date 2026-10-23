@@ -66,3 +66,13 @@ curl -X POST TU_URL/api/pet/request -H "Authorization: Bearer TOKEN"
 - Energía y alegría bajan despacio pero **nunca de 30**; no hay pérdida de progreso ni la mascota se escapa.
 - **Modo descanso:** pausa el cuidado y el desgaste.
 - Accesorios: Gorro (cría), Gafas (joven), Bufanda (adulto).
+
+## 10. Fotos y videos (R2)
+1. Activa R2 en tu cuenta: dash.cloudflare.com → **R2 Object Storage** → activar (puede pedir una tarjeta; el plan gratuito incluye 10 GB y no cobra por la descarga).
+2. Crea el almacenamiento: `npx wrangler r2 bucket create nuvyru-media`
+3. `wrangler.toml` ya trae el bloque `[[r2_buckets]]`.
+4. Vuelve a ejecutar `schema.sql` (añade las tablas de medios y perfiles) y haz `npx wrangler deploy`.
+5. `/api/health` debe mostrar `"storage":true`.
+
+Límites: fotos 8 MB (la app las reduce antes de subirlas), videos 100 MB. Se comprueba el contenido real del archivo, no solo su extensión.
+Los archivos se sirven por una dirección con un identificador imposible de adivinar; quien no tenga ese enlace no puede verlos.
