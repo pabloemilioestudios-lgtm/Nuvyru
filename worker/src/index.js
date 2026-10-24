@@ -103,7 +103,7 @@ const POSTS_SQL = `SELECT p.id,p.body,p.visibility,p.created_at,u.username,u.dis
  FROM nv_posts p JOIN nv_users u ON u.id=p.user_id LEFT JOIN nv_profiles pr ON pr.user_id=u.id
  WHERE (p.visibility='public' OR p.user_id=?1) AND (?2 IS NULL OR u.username=?2) AND (?3 IS NULL OR p.created_at<?3)
  AND (?4 IS NULL OR EXISTS(SELECT 1 FROM nv_post_media pm JOIN nv_media m ON m.id=pm.media_id WHERE pm.post_id=p.id AND (?4='media' OR m.kind=?4)))
- AND (?5 IS NULL OR p.body LIKE ?5 ESCAPE '\\') AND (?6=0 OR p.visibility='public') AND (?7 IS NULL OR p.id=?7)
+ AND (?5 IS NULL OR p.body LIKE ?5 ESCAPE '\\') AND (?6=0 OR p.visibility='public') AND (?7 IS NULL OR p.id=?7) AND NOT EXISTS (SELECT 1 FROM nv_blocks bk WHERE (bk.blocker=?1 AND bk.blocked=p.user_id) OR (bk.blocker=p.user_id AND bk.blocked=?1))
  ORDER BY p.created_at DESC LIMIT 30`;
 async function listPosts(env, me, o = {}) {
   const { results } = await env.DB.prepare(POSTS_SQL).bind(me.id, o.user ?? null, o.before ?? null, o.kind ?? null, o.q ?? null, o.pub ? 1 : 0, o.id ?? null).all();
@@ -151,6 +151,13 @@ async function getPet(env, uid, now) {
   return r;
 }
 
+const SETTING_FLAGS = ["orya_posts", "notif_likes", "notif_comments", "notif_follows"];
+async function getSettings(env, uid) {
+  const r = (await env.DB.prepare("SELECT * FROM nv_settings WHERE user_id=?").bind(uid).first()) || { default_visibility: "public", orya_posts: 0, notif_likes: 1, notif_comments: 1, notif_follows: 1 };
+  return { default_visibility: r.default_visibility, ...Object.fromEntries(SETTING_FLAGS.map((k) => [k, !!r[k]])) };
+}
+// motivos de denuncia; 1 = prioridad alta (seguridad de personas)
+const REASONS = { spam: 0, harassment: 0, hate: 0, sexual: 0, violence: 1, selfharm: 1, minor: 1, scam: 0, illegal: 0, ip: 0, bug: 0, other: 0 };
 const PLANNED = { "/api/comments": 3, "/api/follows": 3, "/api/notifications": 3, "/api/messages": 4, "/api/badges": 5, "/api/orya": 6, "/api/live": 7 };
 
 export default {
@@ -264,6 +271,9 @@ export default {
           env.DB.prepare(`DELETE FROM nv_likes WHERE post_id IN ${own} OR user_id=?`).bind(me.id, me.id),
           env.DB.prepare(`DELETE FROM nv_saves WHERE post_id IN ${own} OR user_id=?`).bind(me.id, me.id),
           env.DB.prepare(`DELETE FROM nv_post_media WHERE post_id IN ${own}`).bind(me.id),
+          env.DB.prepare("DELETE FROM nv_reports WHERE reporter_id=? OR (target_type='user' AND target_id=?) OR (target_type='post' AND target_id IN (SELECT id FROM nv_posts WHERE user_id=?))").bind(me.id, me.id, me.id),
+          env.DB.prepare("DELETE FROM nv_blocks WHERE blocker=? OR blocked=?").bind(me.id, me.id),
+          env.DB.prepare("DELETE FROM nv_settings WHERE user_id=?").bind(me.id),
           env.DB.prepare("DELETE FROM nv_media WHERE user_id=?").bind(me.id),
           env.DB.prepare("DELETE FROM nv_posts WHERE user_id=?").bind(me.id),
           env.DB.prepare("DELETE FROM nv_profiles WHERE user_id=?").bind(me.id),
@@ -439,7 +449,7 @@ export default {
       }
       if ((mt = p.match(/^\/api\/posts\/([0-9a-f-]{36})\/(like|save)$/)) && m === "POST") {
         if (!(await limit(env, "act:" + me.id, 120, 60))) return fail(429, "rate_limited", "Demasiadas acciones seguidas");
-        const ok = await env.DB.prepare("SELECT id FROM nv_posts WHERE id=? AND (visibility='public' OR user_id=?)").bind(mt[1], me.id).first();
+        const ok = await env.DB.prepare("SELECT id FROM nv_posts WHERE id=? AND (visibility='public' OR user_id=?) AND NOT EXISTS (SELECT 1 FROM nv_blocks bk WHERE (bk.blocker=? AND bk.blocked=nv_posts.user_id) OR (bk.blocker=nv_posts.user_id AND bk.blocked=?))").bind(mt[1], me.id, me.id, me.id).first();
         if (!ok) return fail(404, "not_found", "La publicación no existe");
         const t = mt[2] === "like" ? "nv_likes" : "nv_saves";
         const had = await env.DB.prepare(`SELECT 1 FROM ${t} WHERE post_id=? AND user_id=?`).bind(mt[1], me.id).first();
@@ -461,10 +471,103 @@ export default {
         return out({ ok: true });
       }
 
+      // ---- Ajustes y seguridad
+      if (p === "/api/settings" && m === "GET") return out({ settings: await getSettings(env, me.id) });
+      if (p === "/api/settings" && m === "PATCH") {
+        const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
+        const next = await getSettings(env, me.id);
+        if (b.default_visibility !== undefined) {
+          if (!["public", "private"].includes(b.default_visibility)) return fail(400, "invalid_setting", "Valor no válido");
+          next.default_visibility = b.default_visibility;
+        }
+        for (const k of SETTING_FLAGS) if (b[k] !== undefined) next[k] = !!b[k];
+        await env.DB.prepare("INSERT INTO nv_settings (user_id,default_visibility,orya_posts,notif_likes,notif_comments,notif_follows) VALUES (?,?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET default_visibility=excluded.default_visibility,orya_posts=excluded.orya_posts,notif_likes=excluded.notif_likes,notif_comments=excluded.notif_comments,notif_follows=excluded.notif_follows")
+          .bind(me.id, next.default_visibility, +next.orya_posts, +next.notif_likes, +next.notif_comments, +next.notif_follows).run();
+        return out({ settings: next });
+      }
+      if (p === "/api/me/password" && m === "POST") {
+        if (!(await limit(env, "pw:" + me.id, 5, 900))) return fail(429, "rate_limited", "Demasiados intentos. Espera unos minutos");
+        const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
+        const cur = String(b.current || "").slice(0, 128), nw = String(b.next || "");
+        if (nw.length < 8 || nw.length > 128) return fail(400, "invalid_password", "La contraseña nueva debe tener entre 8 y 128 caracteres");
+        const row = await env.DB.prepare("SELECT pass_hash,pass_salt FROM nv_users WHERE id=?").bind(me.id).first();
+        if (!same(await pbkdf2(cur, row.pass_salt), row.pass_hash)) return fail(403, "invalid_credentials", "La contraseña actual no es correcta");
+        if (nw === cur) return fail(400, "same_password", "La contraseña nueva debe ser distinta a la actual");
+        const salt = rand(16), hash = await pbkdf2(nw, salt), keep = await sha(req.headers.get("Authorization").slice(7));
+        await env.DB.batch([
+          env.DB.prepare("UPDATE nv_users SET pass_hash=?, pass_salt=? WHERE id=?").bind(hash, salt, me.id),
+          env.DB.prepare("DELETE FROM nv_sessions WHERE user_id=? AND token_hash<>?").bind(me.id, keep),
+        ]);
+        return out({ ok: true });
+      }
+      if (p === "/api/auth/logout_all" && m === "POST") {
+        await env.DB.prepare("DELETE FROM nv_sessions WHERE user_id=?").bind(me.id).run();
+        return out({ ok: true });
+      }
+      if (p === "/api/me/export" && m === "GET") {
+        if (!(await limit(env, "exp:" + me.id, 3, 3600))) return fail(429, "rate_limited", "Ya descargaste tus datos varias veces. Inténtalo más tarde");
+        const q = async (sql) => (await env.DB.prepare(sql).bind(me.id).all()).results;
+        return out({
+          exportado_el: new Date().toISOString(), perfil: pub(me), cuenta_creada: me.created_at, ajustes: await getSettings(env, me.id),
+          publicaciones: await q("SELECT id,body,visibility,created_at FROM nv_posts WHERE user_id=? ORDER BY created_at"),
+          archivos: await q("SELECT m.id,m.kind,m.mime,m.size,pm.post_id FROM nv_media m LEFT JOIN nv_post_media pm ON pm.media_id=m.id WHERE m.user_id=?"),
+          me_gusta: (await q("SELECT post_id FROM nv_likes WHERE user_id=?")).map((r) => r.post_id),
+          guardados: (await q("SELECT post_id FROM nv_saves WHERE user_id=?")).map((r) => r.post_id),
+          mascota: (await q("SELECT status,species,name,xp,accessory,requested_at,hatched_at FROM nv_pets WHERE user_id=?"))[0] || null,
+          bloqueados: (await q("SELECT u.username FROM nv_blocks b JOIN nv_users u ON u.id=b.blocked WHERE b.blocker=?")).map((r) => r.username),
+          denuncias_enviadas: await q("SELECT target_type,reason,created_at FROM nv_reports WHERE reporter_id=?"),
+        });
+      }
+
+      // ---- Bloqueos
+      if (p === "/api/blocks" && m === "GET") {
+        const { results } = await env.DB.prepare("SELECT u.username,u.display_name,pr.avatar_id FROM nv_blocks b JOIN nv_users u ON u.id=b.blocked LEFT JOIN nv_profiles pr ON pr.user_id=u.id WHERE b.blocker=? ORDER BY b.created_at DESC").bind(me.id).all();
+        return out({ blocks: results.map((r) => ({ ...r, avatar_id: r.avatar_id || null })) });
+      }
+      if (p === "/api/blocks" && m === "POST") {
+        if (!(await limit(env, "blk:" + me.id, 60, 3600))) return fail(429, "rate_limited", "Demasiadas acciones seguidas");
+        const b = await readBody(req), target = b && (await env.DB.prepare("SELECT id FROM nv_users WHERE username=?").bind(String(b.username || "").toLowerCase()).first());
+        if (!target) return fail(404, "not_found", "Ese usuario no existe");
+        if (target.id === me.id) return fail(400, "self", "No puedes bloquearte a ti mismo");
+        await env.DB.prepare("INSERT OR IGNORE INTO nv_blocks (blocker,blocked,created_at) VALUES (?,?,?)").bind(me.id, target.id, Date.now()).run();
+        return out({ ok: true });
+      }
+      if ((mt = p.match(/^\/api\/blocks\/([A-Za-z0-9_.]{3,24})$/)) && m === "DELETE") {
+        const target = await env.DB.prepare("SELECT id FROM nv_users WHERE username=?").bind(mt[1].toLowerCase()).first();
+        if (target) await env.DB.prepare("DELETE FROM nv_blocks WHERE blocker=? AND blocked=?").bind(me.id, target.id).run();
+        return out({ ok: true });
+      }
+
+      // ---- Denuncias (las revisa una persona del equipo; la otra parte nunca recibe aviso)
+      if (p === "/api/reports" && m === "POST") {
+        if (!(await limit(env, "rep:" + me.id, 20, 3600))) return fail(429, "rate_limited", "Has enviado muchas denuncias seguidas. Inténtalo más tarde");
+        const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
+        const type = b.type, reason = String(b.reason || ""), details = String(b.details || "").trim();
+        if (!["post", "user", "app"].includes(type) || !Object.hasOwn(REASONS, reason) || (type !== "app" && reason === "bug")) return fail(400, "invalid_report", "Elige un motivo válido");
+        if (details.length > 500) return fail(400, "invalid_details", "Los detalles admiten hasta 500 caracteres");
+        let target = crypto.randomUUID();
+        if (type === "post") {
+          const id = String(b.target || "");
+          const post = UUID.test(id) && (await env.DB.prepare("SELECT user_id FROM nv_posts WHERE id=? AND (visibility='public' OR user_id=?)").bind(id, me.id).first());
+          if (!post) return fail(404, "not_found", "La publicación no existe");
+          if (post.user_id === me.id) return fail(400, "self", "No puedes denunciar tu propia publicación");
+          target = id;
+        } else if (type === "user") {
+          const u = await env.DB.prepare("SELECT id FROM nv_users WHERE username=?").bind(String(b.target || "").toLowerCase()).first();
+          if (!u) return fail(404, "not_found", "Ese usuario no existe");
+          if (u.id === me.id) return fail(400, "self", "No puedes denunciarte a ti mismo");
+          target = u.id;
+        }
+        if (await env.DB.prepare("SELECT 1 FROM nv_reports WHERE reporter_id=? AND target_type=? AND target_id=?").bind(me.id, type, target).first()) return out({ ok: true, duplicate: true });
+        await env.DB.prepare("INSERT INTO nv_reports (id,reporter_id,target_type,target_id,reason,details,priority,created_at) VALUES (?,?,?,?,?,?,?,?)")
+          .bind(crypto.randomUUID(), me.id, type, target, reason, details, REASONS[reason], Date.now()).run();
+        return out({ ok: true, duplicate: false }, 201);
+      }
+
       // ---- Perfiles ajenos, búsqueda y tendencias
       if ((mt = p.match(/^\/api\/users\/([A-Za-z0-9_.]{3,24})$/)) && m === "GET") {
         const u = await env.DB.prepare(PROFILE + " WHERE u.username=?").bind(mt[1].toLowerCase()).first();
-        if (!u) return fail(404, "not_found", "Ese usuario no existe");
+        if (!u || (u.id !== me.id && (await env.DB.prepare("SELECT 1 FROM nv_blocks WHERE (blocker=? AND blocked=?) OR (blocker=? AND blocked=?)").bind(me.id, u.id, u.id, me.id).first()))) return fail(404, "not_found", "Ese usuario no existe");
         const cnt = await env.DB.prepare("SELECT COUNT(*) AS n FROM nv_posts WHERE user_id=? AND (visibility='public' OR user_id=?)").bind(u.id, me.id).first();
         const pt = await env.DB.prepare("SELECT species,name,xp,accessory,energy FROM nv_pets WHERE user_id=? AND status='hatched' AND show_on_profile=1").bind(u.id).first();
         return out({ user: { ...pub(u), created_at: u.created_at, post_count: cnt.n, is_me: u.id === me.id, pet: pt ? { species: pt.species, name: pt.name, stage: stageOf(pt.xp), accessory: pt.accessory, energy: pt.energy } : null } });
@@ -475,8 +578,8 @@ export default {
         if (!q) return out({ users: [], posts: [] });
         const uq = q.replace(/^@/, ""), like = (s) => "%" + s.replace(/[\\%_]/g, "\\$&") + "%";
         const { results: users } = await env.DB.prepare(
-          "SELECT u.username,u.display_name,u.bio,pr.avatar_id FROM nv_users u LEFT JOIN nv_profiles pr ON pr.user_id=u.id WHERE u.username LIKE ?1 ESCAPE '\\' OR u.display_name LIKE ?1 ESCAPE '\\' ORDER BY (u.username=?2) DESC, u.username LIMIT 10"
-        ).bind(like(uq), uq.toLowerCase()).all();
+          "SELECT u.username,u.display_name,u.bio,pr.avatar_id FROM nv_users u LEFT JOIN nv_profiles pr ON pr.user_id=u.id WHERE (u.username LIKE ?1 ESCAPE '\\' OR u.display_name LIKE ?1 ESCAPE '\\') AND NOT EXISTS (SELECT 1 FROM nv_blocks bk WHERE (bk.blocker=?3 AND bk.blocked=u.id) OR (bk.blocker=u.id AND bk.blocked=?3)) ORDER BY (u.username=?2) DESC, u.username LIMIT 10"
+        ).bind(like(uq), uq.toLowerCase(), me.id).all();
         return out({ users: users.map((u) => ({ ...u, avatar_id: u.avatar_id || null })), posts: await listPosts(env, me, { q: like(q), pub: true }) });
       }
       if (p === "/api/trending" && m === "GET") {

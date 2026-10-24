@@ -67,3 +67,22 @@ CREATE TABLE IF NOT EXISTS nv_uploads (
   mime TEXT NOT NULL, size INTEGER NOT NULL, created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS nv_uploads_user ON nv_uploads(user_id);
+
+-- Ajustes, bloqueos y denuncias
+CREATE TABLE IF NOT EXISTS nv_settings (
+  user_id TEXT PRIMARY KEY,
+  default_visibility TEXT NOT NULL DEFAULT 'public' CHECK (default_visibility IN ('public','private')),
+  orya_posts INTEGER NOT NULL DEFAULT 0, notif_likes INTEGER NOT NULL DEFAULT 1,
+  notif_comments INTEGER NOT NULL DEFAULT 1, notif_follows INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS nv_blocks (
+  blocker TEXT NOT NULL, blocked TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (blocker, blocked)
+);
+CREATE INDEX IF NOT EXISTS nv_blocks_blocked ON nv_blocks(blocked);
+CREATE TABLE IF NOT EXISTS nv_reports (
+  id TEXT PRIMARY KEY, reporter_id TEXT NOT NULL, target_type TEXT NOT NULL CHECK (target_type IN ('post','user','app')),
+  target_id TEXT NOT NULL, reason TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', priority INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'open', created_at INTEGER NOT NULL,
+  UNIQUE (reporter_id, target_type, target_id)
+);
+CREATE INDEX IF NOT EXISTS nv_reports_open ON nv_reports(status, priority DESC, created_at);

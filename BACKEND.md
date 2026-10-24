@@ -76,3 +76,27 @@ curl -X POST TU_URL/api/pet/request -H "Authorization: Bearer TOKEN"
 
 Límites: fotos 8 MB (la app las reduce antes de subirlas), videos 100 MB. Se comprueba el contenido real del archivo, no solo su extensión.
 Los archivos se sirven por una dirección con un identificador imposible de adivinar; quien no tenga ese enlace no puede verlos.
+
+## 11. Denuncias, bloqueos y ajustes
+**Bloqueos:** quien bloquea y la persona bloqueada dejan de verse en inicio, búsqueda, explorar, videos y perfiles. No se avisa a nadie.
+**Denuncias:** se guardan en la tabla `nv_reports`. La otra persona nunca recibe aviso. Las de seguridad (peligro para menores, autolesión, violencia) quedan con `priority = 1`. Todavía no hay panel de moderación: las revisa quien administra, con estos comandos (en la carpeta `worker`):
+
+Ver las denuncias abiertas, las prioritarias primero:
+```
+npx wrangler d1 execute orya-db --remote --command "SELECT r.id, r.priority, r.target_type, r.reason, r.details, datetime(r.created_at/1000,'unixepoch') AS fecha, r.target_id FROM nv_reports r WHERE r.status='open' ORDER BY r.priority DESC, r.created_at LIMIT 20"
+```
+Ver la publicación denunciada:
+```
+npx wrangler d1 execute orya-db --remote --command "SELECT p.id, u.username, p.body FROM nv_posts p JOIN nv_users u ON u.id=p.user_id WHERE p.id='ID_DE_LA_PUBLICACION'"
+```
+Quitar una publicación (y sus likes y guardados):
+```
+npx wrangler d1 execute orya-db --remote --command "DELETE FROM nv_likes WHERE post_id='ID'; DELETE FROM nv_saves WHERE post_id='ID'; DELETE FROM nv_post_media WHERE post_id='ID'; DELETE FROM nv_posts WHERE id='ID'"
+```
+Marcar una denuncia como resuelta:
+```
+npx wrangler d1 execute orya-db --remote --command "UPDATE nv_reports SET status='resuelta' WHERE id='ID_DE_LA_DENUNCIA'"
+```
+Si una denuncia habla de un menor en peligro inmediato, contacta a las autoridades de tu país; no esperes a revisarla aquí.
+
+**Importante antes de abrir la app al público:** hace falta una persona que revise las denuncias con regularidad y un panel para hacerlo sin comandos (lo siguiente a construir).
