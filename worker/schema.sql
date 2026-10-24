@@ -60,3 +60,10 @@ CREATE TABLE IF NOT EXISTS nv_profiles (
   website TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', pronouns TEXT NOT NULL DEFAULT '',
   accent TEXT NOT NULL DEFAULT 'violet'
 );
+
+-- Subidas de video por partes (hasta 200 MB)
+CREATE TABLE IF NOT EXISTS nv_uploads (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, upload_id TEXT NOT NULL, key TEXT NOT NULL,
+  mime TEXT NOT NULL, size INTEGER NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_uploads_user ON nv_uploads(user_id);

@@ -56,7 +56,7 @@ const pub = (u) => ({
 // ---- Medios (R2)
 const UUID = /^[0-9a-f-]{36}$/;
 const ACCENTS = ["violet", "blue", "cyan", "orange", "pink", "green"];
-const MAX_IMG = 8 * 1024 * 1024, MAX_VID = 100 * 1024 * 1024;
+const MAX_IMG = 8 * 1024 * 1024, MAX_VID_SIMPLE = 95 * 1024 * 1024, MAX_VID = 200 * 1024 * 1024, PART = 20 * 1024 * 1024;
 const IMG_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"], VID_TYPES = ["video/mp4", "video/webm", "video/quicktime"];
 function sniff(mime, b) {
   if (!b || b.length < 12) return false;
@@ -77,6 +77,23 @@ async function dropMedia(env, rows) {
   }
 }
 const qs = (a) => a.map(() => "?").join(",");
+// Copia el cuerpo de la petición a un destino de longitud fija, comprobando antes el tipo real del archivo
+async function pipeBody(req, len, mime, put) {
+  const reader = req.body.getReader(), first = await reader.read();
+  if (mime && !sniff(mime, first.value)) return null;
+  const { readable, writable } = new FixedLengthStream(len);
+  const pipe = (async () => {
+    const w = writable.getWriter(); await w.write(first.value);
+    for (;;) { const r = await reader.read(); if (r.done) break; await w.write(r.value); }
+    await w.close();
+  })();
+  const [res] = await Promise.all([put(readable), pipe]);
+  return res;
+}
+async function dropUploads(env, rows) {
+  for (const u of rows) { try { await env.MEDIA.resumeMultipartUpload(u.key, u.upload_id).abort(); } catch {} }
+  for (const u of rows) await env.DB.prepare("DELETE FROM nv_uploads WHERE id=?").bind(u.id).run();
+}
 
 // ---- Publicaciones
 const POSTS_SQL = `SELECT p.id,p.body,p.visibility,p.created_at,u.username,u.display_name,pr.avatar_id,
@@ -241,6 +258,7 @@ export default {
         if (!same(await pbkdf2(String(b.password || "").slice(0, 128), row.pass_salt), row.pass_hash)) return fail(403, "invalid_credentials", "Contraseña incorrecta");
         const { results: mine } = await env.DB.prepare("SELECT id,key FROM nv_media WHERE user_id=?").bind(me.id).all();
         if (env.MEDIA) for (let i = 0; i < mine.length; i += 1000) await env.MEDIA.delete(mine.slice(i, i + 1000).map((r) => r.key));
+        if (env.MEDIA) { const { results: ups } = await env.DB.prepare("SELECT id,key,upload_id FROM nv_uploads WHERE user_id=?").bind(me.id).all(); await dropUploads(env, ups); }
         const own = "(SELECT id FROM nv_posts WHERE user_id=?)";
         await env.DB.batch([
           env.DB.prepare(`DELETE FROM nv_likes WHERE post_id IN ${own} OR user_id=?`).bind(me.id, me.id),
@@ -256,6 +274,54 @@ export default {
         return out({ ok: true });
       }
 
+      // ---- Videos grandes (hasta 200 MB): subida por partes de 20 MB
+      if (p === "/api/media/multipart" && m === "POST") {
+        if (!env.MEDIA) return fail(503, "no_storage", "El almacenamiento de archivos (R2) no está configurado");
+        if (!(await limit(env, "mpc:" + me.id, 10, 3600))) return fail(429, "rate_limited", "Has iniciado demasiadas subidas. Inténtalo en un rato");
+        const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
+        const mime = String(b.mime || "").toLowerCase(), size = Number(b.size);
+        if (!VID_TYPES.includes(mime)) return fail(415, "unsupported_type", "Formato no admitido. Videos: MP4, WEBM o MOV");
+        if (!Number.isInteger(size) || size <= 0) return fail(400, "bad_request", "Tamaño no válido");
+        if (size > MAX_VID) return fail(413, "too_large", "El video supera 200 MB");
+        const { results: old } = await env.DB.prepare("SELECT id,key,upload_id FROM nv_uploads WHERE created_at<? LIMIT 10").bind(Date.now() - 864e5).all();
+        await dropUploads(env, old);
+        const id = crypto.randomUUID(), key = `u/${me.id}/${id}`;
+        const mp = await env.MEDIA.createMultipartUpload(key, { httpMetadata: { contentType: mime } });
+        await env.DB.prepare("INSERT INTO nv_uploads (id,user_id,upload_id,key,mime,size,created_at) VALUES (?,?,?,?,?,?,?)").bind(id, me.id, mp.uploadId, key, mime, size, Date.now()).run();
+        return out({ upload: { id, part_size: PART, parts: Math.ceil(size / PART) } }, 201);
+      }
+      if ((mt = p.match(/^\/api\/media\/multipart\/([0-9a-f-]{36})\/(\d+|complete|abort)$/)) && ["PUT", "POST"].includes(m)) {
+        const up = await env.DB.prepare("SELECT * FROM nv_uploads WHERE id=? AND user_id=?").bind(mt[1], me.id).first();
+        if (!up) return fail(404, "not_found", "Subida no encontrada");
+        const total = Math.ceil(up.size / PART), mp = env.MEDIA.resumeMultipartUpload(up.key, up.upload_id);
+        if (mt[2] === "abort" && m === "POST") { await dropUploads(env, [up]); return out({ ok: true }); }
+        if (mt[2] === "complete" && m === "POST") {
+          const b = await readBody(req), parts = b && Array.isArray(b.parts) ? b.parts : [];
+          const nums = parts.map((x) => Number(x.partNumber));
+          if (parts.length !== total || new Set(nums).size !== total || nums.some((n) => !Number.isInteger(n) || n < 1 || n > total) || parts.some((x) => typeof x.etag !== "string")) return fail(400, "bad_parts", "Faltan partes del video");
+          let obj;
+          try { obj = await mp.complete(parts.map((x) => ({ partNumber: Number(x.partNumber), etag: x.etag })).sort((a, c) => a.partNumber - c.partNumber)); }
+          catch { await dropUploads(env, [up]); return fail(400, "complete_failed", "No se pudo completar la subida. Inténtalo de nuevo"); }
+          if (obj.size !== up.size) { await env.MEDIA.delete(up.key); await dropUploads(env, [up]); return fail(400, "size_mismatch", "El tamaño del video no coincide"); }
+          await env.DB.batch([
+            env.DB.prepare("INSERT INTO nv_media (id,user_id,kind,mime,size,key,created_at) VALUES (?,?,'video',?,?,?,?)").bind(up.id, me.id, up.mime, up.size, up.key, Date.now()),
+            env.DB.prepare("DELETE FROM nv_uploads WHERE id=?").bind(up.id),
+          ]);
+          return out({ media: { id: up.id, kind: "video", mime: up.mime, size: up.size } }, 201);
+        }
+        if (/^\d+$/.test(mt[2]) && m === "PUT") {
+          const n = Number(mt[2]), len = Number(req.headers.get("Content-Length") || 0);
+          if (n < 1 || n > total) return fail(400, "bad_part", "Número de parte no válido");
+          if (!req.body || len !== (n < total ? PART : up.size - PART * (total - 1))) return fail(400, "bad_part_size", "Tamaño de parte incorrecto");
+          let part;
+          try { part = await pipeBody(req, len, n === 1 ? up.mime : null, (rs) => mp.uploadPart(n, rs)); }
+          catch { return fail(400, "upload_failed", "La parte se interrumpió. Reinténtala"); }
+          if (!part) return fail(415, "invalid_file", "El archivo no es un video válido");
+          return out({ partNumber: part.partNumber, etag: part.etag });
+        }
+        return fail(405, "method_not_allowed", "Método no permitido");
+      }
+
       // ---- Subir fotos y videos (cuerpo binario directo; se guarda en R2 sin cargarlo entero en memoria)
       if (p === "/api/media" && m === "POST") {
         if (!env.MEDIA) return fail(503, "no_storage", "El almacenamiento de archivos (R2) no está configurado");
@@ -264,7 +330,7 @@ export default {
         if (!["image", "video"].includes(kind) || !(kind === "image" ? IMG_TYPES : VID_TYPES).includes(mime)) return fail(415, "unsupported_type", "Formato no admitido. Fotos: JPG, PNG, WEBP o GIF. Videos: MP4, WEBM o MOV");
         const len = Number(req.headers.get("Content-Length") || 0);
         if (!len || !req.body) return fail(411, "length_required", "Falta el tamaño del archivo");
-        if (len > (kind === "image" ? MAX_IMG : MAX_VID)) return fail(413, "too_large", kind === "image" ? "La foto supera 8 MB" : "El video supera 100 MB");
+        if (len > (kind === "image" ? MAX_IMG : MAX_VID_SIMPLE)) return fail(413, "too_large", kind === "image" ? "La foto supera 8 MB" : "Este video es demasiado grande para subirlo de una vez (usa la subida por partes)");
         const reader = req.body.getReader(), first = await reader.read();
         if (!sniff(mime, first.value)) return fail(415, "invalid_file", "El archivo no es válido o no coincide con su formato");
         const id = crypto.randomUUID(), key = `u/${me.id}/${id}`, { readable, writable } = new FixedLengthStream(len);
