@@ -158,6 +158,39 @@ async function getSettings(env, uid) {
 }
 // motivos de denuncia; 1 = prioridad alta (seguridad de personas)
 const REASONS = { spam: 0, harassment: 0, hate: 0, sexual: 0, violence: 1, selfharm: 1, minor: 1, scam: 0, illegal: 0, ip: 0, bug: 0, other: 0 };
+// ---- Historias
+const EMOJIS = ["❤️", "😂", "😮", "😢", "🔥", "👏"];
+const NOBLOCK = (x, t) => `NOT EXISTS (SELECT 1 FROM nv_blocks bk WHERE (bk.blocker=${x} AND bk.blocked=${t}) OR (bk.blocker=${t} AND bk.blocked=${x}))`;
+const STORY_SQL = `SELECT s.id,s.user_id,s.text,s.bg,s.visibility,s.created_at,s.expires_at,s.media_id,m.kind AS media_kind,u.username,u.display_name,pr.avatar_id,
+ EXISTS(SELECT 1 FROM nv_story_views v WHERE v.story_id=s.id AND v.viewer_id=?1) AS seen,
+ (SELECT r.emoji FROM nv_story_reactions r WHERE r.story_id=s.id AND r.user_id=?1) AS my_reaction
+ FROM nv_stories s JOIN nv_users u ON u.id=s.user_id LEFT JOIN nv_profiles pr ON pr.user_id=u.id LEFT JOIN nv_media m ON m.id=s.media_id`;
+const shapeStory = (r) => ({
+  id: r.id, text: r.text, bg: r.bg, visibility: r.visibility, created_at: r.created_at, expires_at: r.expires_at,
+  media: r.media_id ? { id: r.media_id, kind: r.media_kind } : null, seen: !!r.seen, my_reaction: r.my_reaction || null,
+  username: r.username, display_name: r.display_name, avatar_id: r.avatar_id || null,
+});
+function groupStories(rows, me) {
+  const by = new Map();
+  for (const r of rows) {
+    if (!by.has(r.user_id)) by.set(r.user_id, { username: r.username, display_name: r.display_name, avatar_id: r.avatar_id || null, is_me: r.user_id === me.id, stories: [] });
+    by.get(r.user_id).stories.push(shapeStory(r));
+  }
+  const g = [...by.values()].map((x) => ({ ...x, all_seen: x.is_me || x.stories.every((st) => st.seen), latest: x.stories[x.stories.length - 1].created_at }));
+  return g.sort((a, b) => (b.is_me - a.is_me) || (a.all_seen - b.all_seen) || (b.latest - a.latest));
+}
+const visibleStory = (env, me, id, now) =>
+  env.DB.prepare(STORY_SQL + ` WHERE s.id=?2 AND s.expires_at>?3 AND (s.visibility='public' OR s.user_id=?1) AND ${NOBLOCK("?1", "s.user_id")}`).bind(me.id, id, now).first();
+async function purgeStories(env, rows) {
+  for (const r of rows) {
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM nv_story_views WHERE story_id=?").bind(r.id), env.DB.prepare("DELETE FROM nv_story_reactions WHERE story_id=?").bind(r.id),
+      env.DB.prepare("DELETE FROM nv_story_replies WHERE story_id=?").bind(r.id), env.DB.prepare("DELETE FROM nv_highlight_items WHERE story_id=?").bind(r.id),
+      env.DB.prepare("DELETE FROM nv_stories WHERE id=?").bind(r.id),
+    ]);
+  }
+  await dropMedia(env, rows.filter((r) => r.media_id).map((r) => ({ id: r.media_id, key: r.key })));
+}
 const PLANNED = { "/api/comments": 3, "/api/follows": 3, "/api/notifications": 3, "/api/messages": 4, "/api/badges": 5, "/api/orya": 6, "/api/live": 7 };
 
 export default {
@@ -271,6 +304,12 @@ export default {
           env.DB.prepare(`DELETE FROM nv_likes WHERE post_id IN ${own} OR user_id=?`).bind(me.id, me.id),
           env.DB.prepare(`DELETE FROM nv_saves WHERE post_id IN ${own} OR user_id=?`).bind(me.id, me.id),
           env.DB.prepare(`DELETE FROM nv_post_media WHERE post_id IN ${own}`).bind(me.id),
+          env.DB.prepare("DELETE FROM nv_highlight_items WHERE highlight_id IN (SELECT id FROM nv_highlights WHERE user_id=?) OR story_id IN (SELECT id FROM nv_stories WHERE user_id=?)").bind(me.id, me.id),
+          env.DB.prepare("DELETE FROM nv_highlights WHERE user_id=?").bind(me.id),
+          env.DB.prepare("DELETE FROM nv_story_views WHERE viewer_id=? OR story_id IN (SELECT id FROM nv_stories WHERE user_id=?)").bind(me.id, me.id),
+          env.DB.prepare("DELETE FROM nv_story_reactions WHERE user_id=? OR story_id IN (SELECT id FROM nv_stories WHERE user_id=?)").bind(me.id, me.id),
+          env.DB.prepare("DELETE FROM nv_story_replies WHERE from_id=? OR story_id IN (SELECT id FROM nv_stories WHERE user_id=?)").bind(me.id, me.id),
+          env.DB.prepare("DELETE FROM nv_stories WHERE user_id=?").bind(me.id),
           env.DB.prepare("DELETE FROM nv_reports WHERE reporter_id=? OR (target_type='user' AND target_id=?) OR (target_type='post' AND target_id IN (SELECT id FROM nv_posts WHERE user_id=?))").bind(me.id, me.id, me.id),
           env.DB.prepare("DELETE FROM nv_blocks WHERE blocker=? OR blocked=?").bind(me.id, me.id),
           env.DB.prepare("DELETE FROM nv_settings WHERE user_id=?").bind(me.id),
@@ -515,6 +554,8 @@ export default {
           guardados: (await q("SELECT post_id FROM nv_saves WHERE user_id=?")).map((r) => r.post_id),
           mascota: (await q("SELECT status,species,name,xp,accessory,requested_at,hatched_at FROM nv_pets WHERE user_id=?"))[0] || null,
           bloqueados: (await q("SELECT u.username FROM nv_blocks b JOIN nv_users u ON u.id=b.blocked WHERE b.blocker=?")).map((r) => r.username),
+          historias: await q("SELECT id,text,visibility,created_at,expires_at FROM nv_stories WHERE user_id=? ORDER BY created_at"),
+          destacadas: await q("SELECT id,title,created_at FROM nv_highlights WHERE user_id=?"),
           denuncias_enviadas: await q("SELECT target_type,reason,created_at FROM nv_reports WHERE reporter_id=?"),
         });
       }
@@ -562,6 +603,144 @@ export default {
         await env.DB.prepare("INSERT INTO nv_reports (id,reporter_id,target_type,target_id,reason,details,priority,created_at) VALUES (?,?,?,?,?,?,?,?)")
           .bind(crypto.randomUUID(), me.id, type, target, reason, details, REASONS[reason], Date.now()).run();
         return out({ ok: true, duplicate: false }, 201);
+      }
+
+      // ---- Historias (24 h)
+      if (p === "/api/stories" && m === "POST") {
+        if (!(await limit(env, "story:" + me.id, 30, 86400))) return fail(429, "rate_limited", "Has publicado muchas historias hoy");
+        const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
+        const text = String(b.text || "").trim(), bg = b.bg === undefined ? "violet" : String(b.bg), vis = b.visibility === "private" ? "private" : "public";
+        if (text.length > 200) return fail(400, "invalid_text", "El texto admite hasta 200 caracteres");
+        if (!ACCENTS.includes(bg)) return fail(400, "invalid_bg", "Color no válido");
+        let mid = null;
+        if (b.media) {
+          mid = String(b.media);
+          if (!UUID.test(mid) || !(await env.DB.prepare("SELECT 1 FROM nv_media WHERE id=? AND user_id=? AND attached=0").bind(mid, me.id).first())) return fail(400, "invalid_media", "La foto o el video no es válido");
+        }
+        if (!mid && !text) return fail(400, "empty_story", "Añade una foto, un video o un texto");
+        const id = crypto.randomUUID(), now = Date.now();
+        await env.DB.batch([
+          env.DB.prepare("INSERT INTO nv_stories (id,user_id,media_id,text,bg,visibility,created_at,expires_at) VALUES (?,?,?,?,?,?,?,?)").bind(id, me.id, mid, text, bg, vis, now, now + 864e5),
+          ...(mid ? [env.DB.prepare("UPDATE nv_media SET attached=1 WHERE id=?").bind(mid)] : []),
+        ]);
+        const { results: old } = await env.DB.prepare("SELECT s.id,s.media_id,m.key FROM nv_stories s LEFT JOIN nv_media m ON m.id=s.media_id WHERE s.created_at<? AND NOT EXISTS (SELECT 1 FROM nv_highlight_items i WHERE i.story_id=s.id) LIMIT 20").bind(now - 30 * 864e5).all();
+        await purgeStories(env, old);
+        return out({ story: shapeStory({ ...(await env.DB.prepare(STORY_SQL + " WHERE s.id=?2").bind(me.id, id).first()) }) }, 201);
+      }
+      if (p === "/api/stories" && m === "GET") {
+        const { results } = await env.DB.prepare(STORY_SQL + ` WHERE s.expires_at>?2 AND (s.visibility='public' OR s.user_id=?1) AND ${NOBLOCK("?1", "s.user_id")} ORDER BY s.created_at ASC LIMIT 300`).bind(me.id, Date.now()).all();
+        return out({ groups: groupStories(results, me).slice(0, 40) });
+      }
+      if (p === "/api/stories/archive" && m === "GET") {
+        const { results } = await env.DB.prepare(STORY_SQL + " WHERE s.user_id=?1 ORDER BY s.created_at DESC LIMIT 60").bind(me.id).all();
+        const ids = results.map((r) => r.id), hl = new Set();
+        if (ids.length) for (const x of (await env.DB.prepare(`SELECT DISTINCT story_id FROM nv_highlight_items WHERE story_id IN (${qs(ids)})`).bind(...ids).all()).results) hl.add(x.story_id);
+        const now = Date.now();
+        return out({ stories: results.map((r) => ({ ...shapeStory(r), active: r.expires_at > now, highlighted: hl.has(r.id) })) });
+      }
+      if ((mt = p.match(/^\/api\/stories\/user\/([A-Za-z0-9_.]{3,24})$/)) && m === "GET") {
+        const u = await env.DB.prepare("SELECT id FROM nv_users WHERE username=?").bind(mt[1].toLowerCase()).first();
+        if (!u) return fail(404, "not_found", "Ese usuario no existe");
+        const { results } = await env.DB.prepare(STORY_SQL + ` WHERE s.user_id=?4 AND s.expires_at>?2 AND (s.visibility='public' OR s.user_id=?1) AND ${NOBLOCK("?1", "s.user_id")} ORDER BY s.created_at ASC`).bind(me.id, Date.now(), 0, u.id).all();
+        return out({ stories: results.map(shapeStory), all_seen: results.every((r) => r.seen) });
+      }
+      if ((mt = p.match(/^\/api\/stories\/([0-9a-f-]{36})\/(view|react|reply|activity)$/))) {
+        const id = mt[1], act = mt[2], now = Date.now();
+        if (act === "activity" && m === "GET") {
+          if (!(await env.DB.prepare("SELECT 1 FROM nv_stories WHERE id=? AND user_id=?").bind(id, me.id).first())) return fail(404, "not_found", "La historia no existe o no es tuya");
+          const { results: views } = await env.DB.prepare("SELECT u.username,u.display_name,pr.avatar_id,v.viewed_at,(SELECT emoji FROM nv_story_reactions r WHERE r.story_id=v.story_id AND r.user_id=v.viewer_id) AS reaction FROM nv_story_views v JOIN nv_users u ON u.id=v.viewer_id LEFT JOIN nv_profiles pr ON pr.user_id=u.id WHERE v.story_id=? ORDER BY v.viewed_at DESC LIMIT 200").bind(id).all();
+          const { results: replies } = await env.DB.prepare("SELECT rp.id,u.username,u.display_name,pr.avatar_id,rp.text,rp.created_at FROM nv_story_replies rp JOIN nv_users u ON u.id=rp.from_id LEFT JOIN nv_profiles pr ON pr.user_id=u.id WHERE rp.story_id=? ORDER BY rp.created_at DESC LIMIT 200").bind(id).all();
+          return out({ views: views.map((v) => ({ ...v, avatar_id: v.avatar_id || null, reaction: v.reaction || null })), replies: replies.map((r) => ({ ...r, avatar_id: r.avatar_id || null })), view_count: views.length, reaction_count: views.filter((v) => v.reaction).length });
+        }
+        if (act !== "activity" && m === "POST") {
+          if (!(await limit(env, "sact:" + me.id, 300, 3600))) return fail(429, "rate_limited", "Demasiadas acciones seguidas");
+          const st = await visibleStory(env, me, id, now);
+          if (!st) return fail(404, "not_found", "La historia no existe o ya caducó");
+          const own = st.user_id === me.id;
+          if (act === "view") {
+            if (!own) await env.DB.prepare("INSERT OR IGNORE INTO nv_story_views (story_id,viewer_id,viewed_at) VALUES (?,?,?)").bind(id, me.id, now).run();
+            return out({ ok: true });
+          }
+          if (own) return fail(400, "self", "No puedes hacerlo en tu propia historia");
+          const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
+          if (act === "react") {
+            if (b.emoji === null || b.emoji === "") { await env.DB.prepare("DELETE FROM nv_story_reactions WHERE story_id=? AND user_id=?").bind(id, me.id).run(); return out({ ok: true, my_reaction: null }); }
+            if (!EMOJIS.includes(b.emoji)) return fail(400, "invalid_emoji", "Reacción no válida");
+            await env.DB.batch([
+              env.DB.prepare("INSERT OR IGNORE INTO nv_story_views (story_id,viewer_id,viewed_at) VALUES (?,?,?)").bind(id, me.id, now),
+              env.DB.prepare("INSERT INTO nv_story_reactions (story_id,user_id,emoji,created_at) VALUES (?,?,?,?) ON CONFLICT(story_id,user_id) DO UPDATE SET emoji=excluded.emoji,created_at=excluded.created_at").bind(id, me.id, b.emoji, now),
+            ]);
+            return out({ ok: true, my_reaction: b.emoji });
+          }
+          const text = String(b.text || "").trim();
+          if (!text || text.length > 300) return fail(400, "invalid_text", "Escribe una respuesta de hasta 300 caracteres");
+          if (!(await limit(env, "sreply:" + me.id, 30, 3600))) return fail(429, "rate_limited", "Has enviado muchas respuestas seguidas");
+          await env.DB.prepare("INSERT INTO nv_story_replies (id,story_id,from_id,text,created_at) VALUES (?,?,?,?,?)").bind(crypto.randomUUID(), id, me.id, text, now).run();
+          return out({ ok: true }, 201);
+        }
+      }
+      if ((mt = p.match(/^\/api\/stories\/([0-9a-f-]{36})$/)) && m === "DELETE") {
+        const st = await env.DB.prepare("SELECT s.id,s.media_id,m.key FROM nv_stories s LEFT JOIN nv_media m ON m.id=s.media_id WHERE s.id=? AND s.user_id=?").bind(mt[1], me.id).first();
+        if (!st) return fail(404, "not_found", "La historia no existe o no es tuya");
+        await purgeStories(env, [st]);
+        return out({ ok: true });
+      }
+
+      // ---- Destacadas
+      if ((mt = p.match(/^\/api\/users\/([A-Za-z0-9_.]{3,24})\/highlights$/)) && m === "GET") {
+        const u = await env.DB.prepare("SELECT id FROM nv_users WHERE username=?").bind(mt[1].toLowerCase()).first();
+        if (!u || (u.id !== me.id && (await env.DB.prepare("SELECT 1 FROM nv_blocks WHERE (blocker=? AND blocked=?) OR (blocker=? AND blocked=?)").bind(me.id, u.id, u.id, me.id).first()))) return fail(404, "not_found", "Ese usuario no existe");
+        const first = (col) => `(SELECT ${col} FROM nv_highlight_items i JOIN nv_stories s ON s.id=i.story_id LEFT JOIN nv_media md ON md.id=s.media_id WHERE i.highlight_id=h.id ORDER BY i.pos LIMIT 1)`;
+        const { results } = await env.DB.prepare(`SELECT h.id,h.title,h.created_at,(SELECT COUNT(*) FROM nv_highlight_items i WHERE i.highlight_id=h.id) AS n,${first("s.media_id")} AS cover_media,${first("md.kind")} AS cover_kind,${first("s.bg")} AS cover_bg FROM nv_highlights h WHERE h.user_id=? ORDER BY h.created_at DESC`).bind(u.id).all();
+        return out({ highlights: results.map((h) => ({ id: h.id, title: h.title, count: h.n, cover: h.cover_media ? { id: h.cover_media, kind: h.cover_kind } : null, bg: h.cover_bg || "violet" })) });
+      }
+      if (p === "/api/highlights" && m === "POST") {
+        const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
+        const title = String(b.title || "").trim(), ids = Array.isArray(b.stories) ? b.stories.map(String) : [];
+        if (title.length < 1 || title.length > 20) return fail(400, "invalid_title", "El título debe tener entre 1 y 20 caracteres");
+        if (!ids.length || ids.length > 30 || new Set(ids).size !== ids.length || ids.some((x) => !UUID.test(x))) return fail(400, "invalid_stories", "Elige entre 1 y 30 historias");
+        if ((await env.DB.prepare("SELECT COUNT(*) AS n FROM nv_highlights WHERE user_id=?").bind(me.id).first()).n >= 20) return fail(400, "too_many", "Puedes tener hasta 20 destacadas");
+        const own = await env.DB.prepare(`SELECT id FROM nv_stories WHERE user_id=? AND id IN (${qs(ids)})`).bind(me.id, ...ids).all();
+        if (own.results.length !== ids.length) return fail(400, "invalid_stories", "Solo puedes destacar tus propias historias");
+        const id = crypto.randomUUID();
+        await env.DB.batch([env.DB.prepare("INSERT INTO nv_highlights (id,user_id,title,created_at) VALUES (?,?,?,?)").bind(id, me.id, title, Date.now()), ...ids.map((x, i) => env.DB.prepare("INSERT INTO nv_highlight_items (highlight_id,story_id,pos) VALUES (?,?,?)").bind(id, x, i))]);
+        return out({ highlight: { id, title, count: ids.length } }, 201);
+      }
+      if ((mt = p.match(/^\/api\/highlights\/([0-9a-f-]{36})$/))) {
+        const h = await env.DB.prepare("SELECT h.id,h.title,h.user_id,u.username,u.display_name FROM nv_highlights h JOIN nv_users u ON u.id=h.user_id WHERE h.id=?").bind(mt[1]).first();
+        const hidden = !h || (h.user_id !== me.id && (await env.DB.prepare("SELECT 1 FROM nv_blocks WHERE (blocker=? AND blocked=?) OR (blocker=? AND blocked=?)").bind(me.id, h.user_id, h.user_id, me.id).first()));
+        if (hidden) return fail(404, "not_found", "La destacada no existe");
+        if (m === "GET") {
+          const { results } = await env.DB.prepare(STORY_SQL + " JOIN nv_highlight_items hi ON hi.story_id=s.id WHERE hi.highlight_id=?2 ORDER BY hi.pos").bind(me.id, h.id).all();
+          return out({ highlight: { id: h.id, title: h.title, username: h.username, display_name: h.display_name, is_me: h.user_id === me.id }, stories: results.map(shapeStory) });
+        }
+        if (h.user_id !== me.id) return fail(404, "not_found", "La destacada no existe");
+        if (m === "DELETE") {
+          await env.DB.batch([env.DB.prepare("DELETE FROM nv_highlight_items WHERE highlight_id=?").bind(h.id), env.DB.prepare("DELETE FROM nv_highlights WHERE id=?").bind(h.id)]);
+          return out({ ok: true });
+        }
+        if (m === "PATCH") {
+          const b = await readBody(req); if (!b) return fail(400, "bad_request", "Solicitud no válida");
+          const title = b.title === undefined ? h.title : String(b.title).trim();
+          if (title.length < 1 || title.length > 20) return fail(400, "invalid_title", "El título debe tener entre 1 y 20 caracteres");
+          const add = Array.isArray(b.add) ? b.add.map(String) : [], rem = Array.isArray(b.remove) ? b.remove.map(String) : [];
+          if ([...add, ...rem].some((x) => !UUID.test(x))) return fail(400, "invalid_stories", "Historias no válidas");
+          if (add.length) {
+            const own = await env.DB.prepare(`SELECT id FROM nv_stories WHERE user_id=? AND id IN (${qs(add)})`).bind(me.id, ...add).all();
+            if (own.results.length !== new Set(add).size) return fail(400, "invalid_stories", "Solo puedes destacar tus propias historias");
+          }
+          const cur = (await env.DB.prepare("SELECT COUNT(*) AS n, COALESCE(MAX(pos),-1) AS mx FROM nv_highlight_items WHERE highlight_id=?").bind(h.id).first());
+          const keep = (await env.DB.prepare("SELECT story_id FROM nv_highlight_items WHERE highlight_id=?").bind(h.id).all()).results.map((r) => r.story_id).filter((x) => !rem.includes(x));
+          const fresh = [...new Set(add)].filter((x) => !keep.includes(x));
+          if (keep.length + fresh.length < 1) return fail(400, "empty_highlight", "Una destacada necesita al menos una historia");
+          if (keep.length + fresh.length > 100) return fail(400, "too_many", "Una destacada admite hasta 100 historias");
+          await env.DB.batch([
+            env.DB.prepare("UPDATE nv_highlights SET title=? WHERE id=?").bind(title, h.id),
+            ...rem.map((x) => env.DB.prepare("DELETE FROM nv_highlight_items WHERE highlight_id=? AND story_id=?").bind(h.id, x)),
+            ...fresh.map((x, i) => env.DB.prepare("INSERT OR IGNORE INTO nv_highlight_items (highlight_id,story_id,pos) VALUES (?,?,?)").bind(h.id, x, cur.mx + 1 + i)),
+          ]);
+          return out({ highlight: { id: h.id, title, count: keep.length + fresh.length } });
+        }
       }
 
       // ---- Perfiles ajenos, búsqueda y tendencias

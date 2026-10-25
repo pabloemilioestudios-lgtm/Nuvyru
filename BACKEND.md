@@ -100,3 +100,11 @@ npx wrangler d1 execute orya-db --remote --command "UPDATE nv_reports SET status
 Si una denuncia habla de un menor en peligro inmediato, contacta a las autoridades de tu país; no esperes a revisarla aquí.
 
 **Importante antes de abrir la app al público:** hace falta una persona que revise las denuncias con regularidad y un panel para hacerlo sin comandos (lo siguiente a construir).
+
+## 12. Historias y destacadas
+- Duran **24 horas**; pueden ser foto, video o texto sobre un color, públicas o solo para ti.
+- Mientras no existan los seguidores, las historias públicas de todos aparecen en el inicio (sin las de cuentas bloqueadas). Con los seguidores se filtrarán por ellos.
+- Reacciones (❤️ 😂 😮 😢 🔥 👏, una por persona) y respuestas: las ve solo quien publicó la historia, junto con la lista de quién la vio. Las respuestas pasarán a mensajes directos cuando existan.
+- **Destacadas:** colecciones de tus historias que se conservan en tu perfil aunque caduquen. Las ve cualquiera que vea tu perfil.
+- Archivo: tus historias caducadas se guardan 30 días; pasado ese tiempo se borran (y su archivo), salvo las que estén en una destacada.
+- Borrar una historia elimina sus vistas, reacciones, respuestas y su foto o video. Borrar tu cuenta lo elimina todo.

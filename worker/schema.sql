@@ -86,3 +86,20 @@ CREATE TABLE IF NOT EXISTS nv_reports (
   UNIQUE (reporter_id, target_type, target_id)
 );
 CREATE INDEX IF NOT EXISTS nv_reports_open ON nv_reports(status, priority DESC, created_at);
+
+-- Historias (duran 24 h), reacciones, respuestas y destacadas
+CREATE TABLE IF NOT EXISTS nv_stories (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, media_id TEXT, text TEXT NOT NULL DEFAULT '', bg TEXT NOT NULL DEFAULT 'violet',
+  visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public','private')),
+  created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_stories_user ON nv_stories(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS nv_stories_exp ON nv_stories(expires_at);
+CREATE TABLE IF NOT EXISTS nv_story_views (story_id TEXT NOT NULL, viewer_id TEXT NOT NULL, viewed_at INTEGER NOT NULL, PRIMARY KEY (story_id, viewer_id));
+CREATE TABLE IF NOT EXISTS nv_story_reactions (story_id TEXT NOT NULL, user_id TEXT NOT NULL, emoji TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (story_id, user_id));
+CREATE TABLE IF NOT EXISTS nv_story_replies (id TEXT PRIMARY KEY, story_id TEXT NOT NULL, from_id TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS nv_story_replies_story ON nv_story_replies(story_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS nv_highlights (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS nv_highlights_user ON nv_highlights(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS nv_highlight_items (highlight_id TEXT NOT NULL, story_id TEXT NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (highlight_id, story_id));
+CREATE INDEX IF NOT EXISTS nv_highlight_items_story ON nv_highlight_items(story_id);
