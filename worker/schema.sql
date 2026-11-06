@@ -103,3 +103,50 @@ CREATE TABLE IF NOT EXISTS nv_highlights (id TEXT PRIMARY KEY, user_id TEXT NOT 
 CREATE INDEX IF NOT EXISTS nv_highlights_user ON nv_highlights(user_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS nv_highlight_items (highlight_id TEXT NOT NULL, story_id TEXT NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (highlight_id, story_id));
 CREATE INDEX IF NOT EXISTS nv_highlight_items_story ON nv_highlight_items(story_id);
+
+-- Seguidores, privacidad de cuenta y comentarios
+CREATE TABLE IF NOT EXISTS nv_follows (
+  follower_id TEXT NOT NULL, followee_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'accepted' CHECK (status IN ('accepted','pending')),
+  created_at INTEGER NOT NULL, PRIMARY KEY (follower_id, followee_id)
+);
+CREATE INDEX IF NOT EXISTS nv_follows_followee ON nv_follows(followee_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS nv_follows_follower ON nv_follows(follower_id, status);
+CREATE TABLE IF NOT EXISTS nv_privacy (
+  user_id TEXT PRIMARY KEY, private_account INTEGER NOT NULL DEFAULT 0,
+  msg_who TEXT NOT NULL DEFAULT 'everyone' CHECK (msg_who IN ('everyone','following','nobody'))
+);
+CREATE TABLE IF NOT EXISTS nv_comments (
+  id TEXT PRIMARY KEY, post_id TEXT NOT NULL, user_id TEXT NOT NULL, parent_id TEXT, body TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_comments_post ON nv_comments(post_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS nv_comments_parent ON nv_comments(parent_id, created_at);
+CREATE TABLE IF NOT EXISTS nv_comment_likes (comment_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (comment_id, user_id));
+CREATE TABLE IF NOT EXISTS nv_comment_reports (
+  id TEXT PRIMARY KEY, reporter_id TEXT NOT NULL, comment_id TEXT NOT NULL, reason TEXT NOT NULL, details TEXT NOT NULL DEFAULT '',
+  priority INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open', created_at INTEGER NOT NULL, UNIQUE (reporter_id, comment_id)
+);
+
+-- Mensajes (directos y grupos), rachas compartidas e insignias
+CREATE TABLE IF NOT EXISTS nv_convs (
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('direct','group')), title TEXT, direct_key TEXT UNIQUE,
+  created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS nv_conv_members (
+  conv_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', joined_at INTEGER NOT NULL,
+  last_read_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (conv_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS nv_conv_members_user ON nv_conv_members(user_id);
+CREATE TABLE IF NOT EXISTS nv_messages (
+  id TEXT PRIMARY KEY, conv_id TEXT NOT NULL, sender_id TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', post_id TEXT,
+  created_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS nv_messages_conv ON nv_messages(conv_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS nv_streaks (
+  id TEXT PRIMARY KEY, user_a TEXT NOT NULL, user_b TEXT NOT NULL, proposed_by TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','active')),
+  count INTEGER NOT NULL DEFAULT 0, best INTEGER NOT NULL DEFAULT 0, total_days INTEGER NOT NULL DEFAULT 0,
+  last_day TEXT NOT NULL DEFAULT '', a_last TEXT NOT NULL DEFAULT '', b_last TEXT NOT NULL DEFAULT '',
+  paused INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, UNIQUE (user_a, user_b)
+);
+CREATE TABLE IF NOT EXISTS nv_badges (user_id TEXT NOT NULL, code TEXT NOT NULL, tier TEXT NOT NULL, earned_at INTEGER NOT NULL, PRIMARY KEY (user_id, code));

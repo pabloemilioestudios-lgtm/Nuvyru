@@ -108,3 +108,24 @@ Si una denuncia habla de un menor en peligro inmediato, contacta a las autoridad
 - **Destacadas:** colecciones de tus historias que se conservan en tu perfil aunque caduquen. Las ve cualquiera que vea tu perfil.
 - Archivo: tus historias caducadas se guardan 30 días; pasado ese tiempo se borran (y su archivo), salvo las que estén en una destacada.
 - Borrar una historia elimina sus vistas, reacciones, respuestas y su foto o video. Borrar tu cuenta lo elimina todo.
+
+## 13. Seguidores, cuentas privadas, comentarios, mensajes y rachas
+**Seguidores.** Seguir a una cuenta pública es inmediato; a una privada crea una *solicitud* que la otra persona acepta o rechaza. Una cuenta privada solo muestra sus publicaciones, historias, destacadas y listas a quienes la siguen. Al volver pública una cuenta, sus solicitudes pendientes se aceptan. Bloquear corta el seguimiento y las rachas en ambos sentidos. El inicio "Siguiendo" y las historias muestran solo lo de las personas que sigues.
+
+**Protección de menores (según el año de nacimiento).**
+- Menores de 16: cuenta **privada** por defecto y no pueden hacerla pública.
+- Menores de 18: solo reciben mensajes de personas **a las que ellos siguen**. Una persona adulta no puede escribirles si no la siguen.
+- Cualquier persona puede elegir recibir mensajes de: todos, solo de quien sigue, o nadie.
+
+**Comentarios.** Hasta 300 caracteres, con respuestas de un solo nivel y me gusta. Quien publica puede borrar cualquier comentario de su publicación. Las denuncias de comentarios van a la tabla `nv_comment_reports`.
+
+**Mensajes.** Chats directos y grupos (hasta 20). Se comparten publicaciones, se ve entregado/leído y se pueden borrar los propios. Todavía no es en tiempo real: la app consulta cada pocos segundos (WebSocket llegará con Durable Objects).
+
+**Rachas compartidas (opcionales, sin castigos).** Las dos personas tienen que aceptar. Un día cuenta cuando **ambas** se escriben ese día (hora UTC). Se pueden descansar hasta **2 días sin perderla**; pasado eso empieza una nueva, pero **se conservan la mejor racha y el total de días**. Se puede **pausar** (vacaciones) y **terminar** cuando quieras. No hay avisos de "vas a perderla". Las insignias de racha (7 Bronce, 30 Plata, 100 Oro, 200 Platino, 365 Diamante) las concede el servidor.
+
+**Revisar denuncias de comentarios:**
+```
+npx wrangler d1 execute orya-db --remote --command "SELECT r.id, r.priority, r.reason, r.details, c.body FROM nv_comment_reports r JOIN nv_comments c ON c.id=r.comment_id WHERE r.status='open' ORDER BY r.priority DESC, r.created_at LIMIT 20"
+```
+
+> **Estado de la interfaz:** seguidores, cuentas privadas y comentarios están activos. Los mensajes y las rachas tienen servidor listo y probado, y la interfaz escrita, pero apagada (`const MSG=false` en `index.html`) hasta probarla de punta a punta.

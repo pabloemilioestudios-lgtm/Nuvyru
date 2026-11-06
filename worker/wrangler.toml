@@ -3,7 +3,7 @@ main = "src/index.js"
 compatibility_date = "2026-10-01"
 
 [vars]
-ALLOWED_ORIGIN = "https://pabloemilioestudios-lgtm.github.io"
+ALLOWED_ORIGIN = "https://www.nuvyru.xyz,https://nuvyru.xyz,https://pabloemilioestudios-lgtm.github.io"
 
 [[d1_databases]]
 binding = "DB"
