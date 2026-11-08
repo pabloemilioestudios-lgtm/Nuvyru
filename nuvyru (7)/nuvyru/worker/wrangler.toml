@@ -1,0 +1,15 @@
+name = "nuvyru-api"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+ALLOWED_ORIGIN = "https://www.nuvyru.xyz,https://nuvyru.xyz,https://pabloemilioestudios-lgtm.github.io"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "orya-db"
+database_id = "92667e81-2ecd-4948-aacf-03a3631cba26"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "nuvyru-media"

@@ -1,0 +1,152 @@
+-- Nuvyru · Fase 2. Tablas con prefijo nv_ para convivir con otras tablas de la misma D1.
+CREATE TABLE IF NOT EXISTS nv_users (
+  id TEXT PRIMARY KEY,
+  username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  display_name TEXT NOT NULL,
+  bio TEXT NOT NULL DEFAULT '',
+  pass_hash TEXT NOT NULL,
+  pass_salt TEXT NOT NULL,
+  birth_year INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  avatar_id TEXT
+);
+CREATE TABLE IF NOT EXISTS nv_sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_sessions_user ON nv_sessions(user_id);
+CREATE TABLE IF NOT EXISTS nv_posts (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public','private')),
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_posts_created ON nv_posts(created_at DESC);
+CREATE INDEX IF NOT EXISTS nv_posts_user ON nv_posts(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS nv_likes (post_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (post_id, user_id));
+CREATE TABLE IF NOT EXISTS nv_saves (post_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (post_id, user_id));
+CREATE TABLE IF NOT EXISTS nv_rate (k TEXT PRIMARY KEY, count INTEGER NOT NULL, start INTEGER NOT NULL);
+
+-- Fase 5 (mascotas): una mascota o huevo por usuario
+CREATE TABLE IF NOT EXISTS nv_pets (
+  user_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK (status IN ('egg','hatched')),
+  species TEXT, name TEXT,
+  requested_at INTEGER NOT NULL, hatch_at INTEGER NOT NULL, hatched_at INTEGER,
+  energy INTEGER NOT NULL DEFAULT 70, joy INTEGER NOT NULL DEFAULT 70, xp INTEGER NOT NULL DEFAULT 0,
+  xp_day TEXT NOT NULL DEFAULT '', xp_today INTEGER NOT NULL DEFAULT 0,
+  accessory TEXT NOT NULL DEFAULT 'none',
+  show_on_profile INTEGER NOT NULL DEFAULT 1, reminders INTEGER NOT NULL DEFAULT 0, rest_mode INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  last_feed INTEGER NOT NULL DEFAULT 0, last_play INTEGER NOT NULL DEFAULT 0,
+  last_rest INTEGER NOT NULL DEFAULT 0, last_cuddle INTEGER NOT NULL DEFAULT 0
+);
+
+-- Medios (fotos y videos guardados en R2), perfiles ampliados y álbumes
+CREATE TABLE IF NOT EXISTS nv_media (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('image','video')),
+  mime TEXT NOT NULL, size INTEGER NOT NULL, key TEXT NOT NULL,
+  attached INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_media_user ON nv_media(user_id);
+CREATE TABLE IF NOT EXISTS nv_post_media (
+  post_id TEXT NOT NULL, media_id TEXT NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (post_id, media_id)
+);
+CREATE INDEX IF NOT EXISTS nv_post_media_post ON nv_post_media(post_id, pos);
+CREATE TABLE IF NOT EXISTS nv_profiles (
+  user_id TEXT PRIMARY KEY, avatar_id TEXT, banner_id TEXT,
+  website TEXT NOT NULL DEFAULT '', location TEXT NOT NULL DEFAULT '', pronouns TEXT NOT NULL DEFAULT '',
+  accent TEXT NOT NULL DEFAULT 'violet'
+);
+
+-- Subidas de video por partes (hasta 200 MB)
+CREATE TABLE IF NOT EXISTS nv_uploads (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, upload_id TEXT NOT NULL, key TEXT NOT NULL,
+  mime TEXT NOT NULL, size INTEGER NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_uploads_user ON nv_uploads(user_id);
+
+-- Ajustes, bloqueos y denuncias
+CREATE TABLE IF NOT EXISTS nv_settings (
+  user_id TEXT PRIMARY KEY,
+  default_visibility TEXT NOT NULL DEFAULT 'public' CHECK (default_visibility IN ('public','private')),
+  orya_posts INTEGER NOT NULL DEFAULT 0, notif_likes INTEGER NOT NULL DEFAULT 1,
+  notif_comments INTEGER NOT NULL DEFAULT 1, notif_follows INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS nv_blocks (
+  blocker TEXT NOT NULL, blocked TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (blocker, blocked)
+);
+CREATE INDEX IF NOT EXISTS nv_blocks_blocked ON nv_blocks(blocked);
+CREATE TABLE IF NOT EXISTS nv_reports (
+  id TEXT PRIMARY KEY, reporter_id TEXT NOT NULL, target_type TEXT NOT NULL CHECK (target_type IN ('post','user','app')),
+  target_id TEXT NOT NULL, reason TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', priority INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'open', created_at INTEGER NOT NULL,
+  UNIQUE (reporter_id, target_type, target_id)
+);
+CREATE INDEX IF NOT EXISTS nv_reports_open ON nv_reports(status, priority DESC, created_at);
+
+-- Historias (duran 24 h), reacciones, respuestas y destacadas
+CREATE TABLE IF NOT EXISTS nv_stories (
+  id TEXT PRIMARY KEY, user_id TEXT NOT NULL, media_id TEXT, text TEXT NOT NULL DEFAULT '', bg TEXT NOT NULL DEFAULT 'violet',
+  visibility TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public','private')),
+  created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_stories_user ON nv_stories(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS nv_stories_exp ON nv_stories(expires_at);
+CREATE TABLE IF NOT EXISTS nv_story_views (story_id TEXT NOT NULL, viewer_id TEXT NOT NULL, viewed_at INTEGER NOT NULL, PRIMARY KEY (story_id, viewer_id));
+CREATE TABLE IF NOT EXISTS nv_story_reactions (story_id TEXT NOT NULL, user_id TEXT NOT NULL, emoji TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (story_id, user_id));
+CREATE TABLE IF NOT EXISTS nv_story_replies (id TEXT PRIMARY KEY, story_id TEXT NOT NULL, from_id TEXT NOT NULL, text TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS nv_story_replies_story ON nv_story_replies(story_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS nv_highlights (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS nv_highlights_user ON nv_highlights(user_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS nv_highlight_items (highlight_id TEXT NOT NULL, story_id TEXT NOT NULL, pos INTEGER NOT NULL, PRIMARY KEY (highlight_id, story_id));
+CREATE INDEX IF NOT EXISTS nv_highlight_items_story ON nv_highlight_items(story_id);
+
+-- Seguidores, privacidad de cuenta y comentarios
+CREATE TABLE IF NOT EXISTS nv_follows (
+  follower_id TEXT NOT NULL, followee_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'accepted' CHECK (status IN ('accepted','pending')),
+  created_at INTEGER NOT NULL, PRIMARY KEY (follower_id, followee_id)
+);
+CREATE INDEX IF NOT EXISTS nv_follows_followee ON nv_follows(followee_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS nv_follows_follower ON nv_follows(follower_id, status);
+CREATE TABLE IF NOT EXISTS nv_privacy (
+  user_id TEXT PRIMARY KEY, private_account INTEGER NOT NULL DEFAULT 0,
+  msg_who TEXT NOT NULL DEFAULT 'everyone' CHECK (msg_who IN ('everyone','following','nobody'))
+);
+CREATE TABLE IF NOT EXISTS nv_comments (
+  id TEXT PRIMARY KEY, post_id TEXT NOT NULL, user_id TEXT NOT NULL, parent_id TEXT, body TEXT NOT NULL, created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS nv_comments_post ON nv_comments(post_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS nv_comments_parent ON nv_comments(parent_id, created_at);
+CREATE TABLE IF NOT EXISTS nv_comment_likes (comment_id TEXT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (comment_id, user_id));
+CREATE TABLE IF NOT EXISTS nv_comment_reports (
+  id TEXT PRIMARY KEY, reporter_id TEXT NOT NULL, comment_id TEXT NOT NULL, reason TEXT NOT NULL, details TEXT NOT NULL DEFAULT '',
+  priority INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'open', created_at INTEGER NOT NULL, UNIQUE (reporter_id, comment_id)
+);
+
+-- Mensajes (directos y grupos), rachas compartidas e insignias
+CREATE TABLE IF NOT EXISTS nv_convs (
+  id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('direct','group')), title TEXT, direct_key TEXT UNIQUE,
+  created_by TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS nv_conv_members (
+  conv_id TEXT NOT NULL, user_id TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'member', joined_at INTEGER NOT NULL,
+  last_read_at INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (conv_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS nv_conv_members_user ON nv_conv_members(user_id);
+CREATE TABLE IF NOT EXISTS nv_messages (
+  id TEXT PRIMARY KEY, conv_id TEXT NOT NULL, sender_id TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', post_id TEXT,
+  created_at INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS nv_messages_conv ON nv_messages(conv_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS nv_streaks (
+  id TEXT PRIMARY KEY, user_a TEXT NOT NULL, user_b TEXT NOT NULL, proposed_by TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','active')),
+  count INTEGER NOT NULL DEFAULT 0, best INTEGER NOT NULL DEFAULT 0, total_days INTEGER NOT NULL DEFAULT 0,
+  last_day TEXT NOT NULL DEFAULT '', a_last TEXT NOT NULL DEFAULT '', b_last TEXT NOT NULL DEFAULT '',
+  paused INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, UNIQUE (user_a, user_b)
+);
+CREATE TABLE IF NOT EXISTS nv_badges (user_id TEXT NOT NULL, code TEXT NOT NULL, tier TEXT NOT NULL, earned_at INTEGER NOT NULL, PRIMARY KEY (user_id, code));
